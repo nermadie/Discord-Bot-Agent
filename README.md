@@ -1,6 +1,6 @@
 # 🤖 Discord Agent Bot
 
-> Trợ lý Discord đa năng cho học tập & quản lý công việc: **Calendar + Tasks + Weather + Summary + Countdown**.
+> Trợ lý Discord đa năng cho học tập & quản lý công việc: **Calendar + Tasks + Weather + Summary + Chat + Countdown**.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Discord.py](https://img.shields.io/badge/discord.py-2.x-5865F2)
@@ -28,8 +28,17 @@
 
 ### 📚 Study Summary (AI)
 - Theo dõi tin nhắn tại các channel học tập bạn chọn.
+- Nếu tin nhắn có ảnh/file đính kèm, bot sẽ kèm URL/tên file vào ngữ cảnh gửi model.
 - Tự động tổng hợp nội dung và tạo câu hỏi ôn tập.
+- Trả lời từng câu hỏi bằng `!answer` và nhận đánh giá/nhận xét tự động.
 - Hỗ trợ chia lô (batch) khi lượng tin nhắn lớn.
+
+### 💬 Chatbot trực tiếp
+- Dùng `!chat <nội dung>` để hỏi đáp trực tiếp với AI (có thể đính kèm ảnh).
+- Dùng `!reason <nội dung>` cho reasoning mode (lọc phần `<think>` trước khi hiển thị).
+- Dùng `!reason --show-thinking <nội dung>` để xổ phần `<think>` (owner + bật env).
+- Hiển thị phản hồi bằng embed đẹp + thông tin model đang dùng.
+- Tự động fallback model nếu model chính bị giới hạn lượt gọi.
 
 ### ⏰ Countdown thông minh
 - Tạo countdown sự kiện bất kỳ.
@@ -101,13 +110,42 @@ Tạo file `.env` ở thư mục gốc với nội dung mẫu:
 ```env
 DISCORD_TOKEN=your_discord_bot_token
 GITHUB_TOKEN=your_github_models_token
+
+# Chat trực tiếp (!chat)
+CHAT_MODEL_PRIMARY=openai/gpt-5
+CHAT_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4.1,openai/gpt-4o
+
+# Vision/OCR cho ảnh trong chat (!chat, /chat) - xử lý từng ảnh một
+VISION_MODEL_PRIMARY=meta/Llama-4-Maverick-17B-128E-Instruct-FP8
+VISION_MODEL_FALLBACKS=openai/gpt-4.1-nano,openai/gpt-4o-mini
+
+# Tổng hợp học tập (!summary)
+SUMMARY_MODEL_PRIMARY=openai/gpt-5-chat
+SUMMARY_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4.1,openai/gpt-4o
+
+# Chấm câu trả lời học tập (!answer)
+ANSWER_MODEL_PRIMARY=openai/gpt-5-chat
+ANSWER_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4.1,openai/gpt-4o
+
+# Reasoning mode (!reason, /reason)
+REASONING_MODEL_PRIMARY=deepseek/DeepSeek-R1-0528
+REASONING_MODEL_FALLBACKS=microsoft/Phi-4-reasoning,microsoft/Phi-4-mini-reasoning
+ALLOW_SHOW_REASONING_THINKING=false
+
+# Legacy optional
 GITHUB_MODEL=gpt-4o-mini
+
 WEATHER_API_KEY=your_weatherapi_key
 WEATHER_PROVIDER=weatherapi
 YOUR_USER_ID=123456789012345678
 CHANNEL_MAIN=123456789012345678
 CHANNELS_TO_MONITOR=111111111111111111,222222222222222222
+
+# Optional: sync slash command ngay cho server test
+APP_GUILD_ID=123456789012345678
 ```
+
+> Bạn cũng có thể copy nhanh từ file `.env.example`.
 
 > Gợi ý:
 > - `YOUR_USER_ID`: ID Discord của bạn (để giới hạn lệnh nhạy cảm và mention đúng người).
@@ -150,7 +188,12 @@ Dự án đã có `.gitignore` để tự động chặn các file này.
 
 ## `!help`
 - `!help`: danh sách tổng quan
-- `!help calendar|tasks|countdown|weather|study|automation`
+- `!help calendar|tasks|countdown|weather|study|chatbot|automation`
+
+## Slash Commands (`/`)
+- Bot hỗ trợ slash commands để Discord tự hiện **Command Matching** như giao diện bạn mong muốn.
+- Lệnh chính: `/calendar`, `/events`, `/tasks`, `/countdown`, `/chat`, `/reason`, `/summary`, `/answer`, `/weather`, `/ping`, `/help`.
+- Để slash command hiện ngay (không phải chờ global cache), set `APP_GUILD_ID` trong `.env` rồi restart bot.
 
 ## Calendar
 - `!calendar [date]`
@@ -169,7 +212,17 @@ Dự án đã có `.gitignore` để tự động chặn các file này.
 ## Study
 - `!summary`
 - `!continue`
+- `!answer <số câu> | <câu trả lời>`
 - `!stats`
+
+## Chatbot
+- `!chat <câu hỏi của bạn>`
+- `!chat <câu hỏi> + đính kèm 1-n ảnh` (bot tự trích xuất nội dung từng ảnh rồi trả lời)
+- `!reason <câu hỏi/bài toán cần reasoning>`
+
+## Slash Chatbot
+- `/chat` với các trường ảnh `image_1`, `image_2`, `image_3`, `image_4`
+- `/reason` (có tuỳ chọn `show_thinking`)
 
 ## Weather
 - `!weather`
@@ -214,12 +267,13 @@ Dự án đã có `.gitignore` để tự động chặn các file này.
 3. `!events` và `!tasks` để kiểm tra kết nối Google.
 4. Tạo event/task sắp tới trong vòng 30 phút để kiểm tra reminder.
 5. `!add_countdown Test | today 23:59 | 🎯` để kiểm tra countdown.
+6. `!chat Giải thích OAuth2 là gì` để kiểm tra chat model + fallback.
+7. `!summary` rồi `!answer 1 | ...` để kiểm tra cơ chế hỏi đáp ôn tập.
 
 ---
 
 ## 📌 Roadmap gợi ý
 
-- Thêm `.env.example` mẫu cho onboarding nhanh.
 - Thêm logging chuẩn file + mức log.
 - Thêm Dockerfile để deploy dễ hơn.
 - Tách module lớn trong `discord_bot.py` để dễ bảo trì.
@@ -234,4 +288,4 @@ Dự án đã có `.gitignore` để tự động chặn các file này.
 
 ---
 
-Nếu bạn muốn, mình có thể tạo luôn `.env.example` và phiên bản README song ngữ Việt/Anh ở bước tiếp theo.
+Nếu bạn muốn, mình có thể tách riêng module chatbot/summary thành file độc lập để dễ maintain hơn.
