@@ -54,20 +54,46 @@ def _get_summary_channel_option_items():
     for channel_id in CHANNELS_TO_MONITOR:
         if channel_id == MAIN_CHANNEL_ID:
             continue
-        channel = bot.get_channel(channel_id)
-        label = f"#{channel.name}" if channel else f"channel-{channel_id}"
-        items.append((label, str(channel_id)))
+
+        safe_channel_id = str(channel_id).strip()
+        channel = (
+            bot.get_channel(int(channel_id)) if str(channel_id).isdigit() else None
+        )
+        label = f"#{channel.name}" if channel else f"channel-{safe_channel_id}"
+
+        label = label[:100]
+        safe_value = safe_channel_id[:100]
+        if not safe_value:
+            continue
+        items.append((label, safe_value))
     return items
 
 
 async def summary_channel_autocomplete(interaction: discord.Interaction, current: str):
     """Return filtered summary channel choices for slash autocomplete."""
-    current_text = (current or "").lower().strip()
-    choices = []
-    for name, value in _get_summary_channel_option_items():
-        if not current_text or current_text in name.lower() or current_text in value:
-            choices.append(app_commands.Choice(name=name, value=value))
-    return choices[:25]
+    try:
+        current_text = (current or "").lower().strip()
+        choices = []
+        for name, value in _get_summary_channel_option_items():
+            if (
+                not current_text
+                or current_text in name.lower()
+                or current_text in value
+            ):
+                choices.append(app_commands.Choice(name=name[:100], value=value[:100]))
+        return choices[:25]
+    except Exception:
+        fallback = [app_commands.Choice(name="All monitored channels", value="all")]
+        for channel_id in CHANNELS_TO_MONITOR:
+            if channel_id == MAIN_CHANNEL_ID:
+                continue
+            value = str(channel_id).strip()[:100]
+            if not value:
+                continue
+            fallback.append(
+                app_commands.Choice(name=f"channel-{value}"[:100], value=value)
+            )
+        return fallback[:25]
 
 
 def _today_vn_date():
