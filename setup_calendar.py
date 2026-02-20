@@ -7,6 +7,8 @@ import os
 SCOPES = [
     "https://www.googleapis.com/auth/calendar",  # Read/Write calendar
     "https://www.googleapis.com/auth/tasks",  # Read/Write tasks
+    "https://www.googleapis.com/auth/gmail.readonly",  # Read unread/sent mails
+    "https://www.googleapis.com/auth/gmail.modify",  # Mark read/checkpoint actions
 ]
 
 
@@ -39,6 +41,8 @@ def main():
     print("✅ File token.json đã được tạo với quyền:")
     print("   - Google Calendar (đọc/ghi)")
     print("   - Google Tasks (đọc/ghi)")
+    print("   - Gmail (chỉ đọc)")
+    print("   - Gmail (đánh dấu đã đọc)")
     print("\n🎉 Bây giờ bạn có thể chạy bot!")
 
 
