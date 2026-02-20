@@ -694,13 +694,17 @@ def register_slash_commands(bot, deps):
             question_index += len(numbered_questions)
 
             if has_more:
+                processed_count = max(
+                    1,
+                    int(summary_data.get("processed_count") or SUMMARY_BATCH_SIZE),
+                )
                 summary_state[channel_id] = {
                     "messages": messages,
                     "channel_name": channel_name,
-                    "offset": SUMMARY_BATCH_SIZE,
+                    "offset": processed_count,
                 }
                 await interaction.followup.send(
-                    f"💡 Còn {len(messages) - SUMMARY_BATCH_SIZE} tin nhắn chưa summary trong #{channel_name}. Bấm `Continue Summary` ngay dưới embed vừa gửi hoặc dùng `/continue_summary`.",
+                    f"💡 Còn {max(0, len(messages) - processed_count)} tin nhắn chưa summary trong #{channel_name}. Bấm `Continue Summary` ngay dưới embed vừa gửi hoặc dùng `/continue_summary`.",
                 )
 
         for channel_id, newest_id in fetch_checkpoints.items():

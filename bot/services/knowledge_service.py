@@ -1613,7 +1613,33 @@ class KnowledgeBot:
                 total += 3
             return total
 
-        cleaned = [str(x).strip() for x in (todo_items or []) if str(x).strip()]
+        def normalize_todo_item(todo):
+            if isinstance(todo, dict):
+                task = str(
+                    todo.get("task")
+                    or todo.get("title")
+                    or todo.get("todo")
+                    or todo.get("summary")
+                    or ""
+                ).strip()
+                if not task:
+                    return ""
+                priority = str(todo.get("priority") or "").strip()
+                if priority:
+                    return f"{task} (priority: {priority})"
+                return task
+
+            if isinstance(todo, (list, tuple)):
+                merged = " - ".join([str(x).strip() for x in todo if str(x).strip()])
+                return merged.strip()
+
+            return str(todo or "").strip()
+
+        cleaned = []
+        for item in todo_items or []:
+            normalized = normalize_todo_item(item)
+            if normalized:
+                cleaned.append(normalized)
         dedup = []
         seen = set()
         for item in cleaned:
@@ -2942,14 +2968,32 @@ class KnowledgeBot:
         if not messages:
             return None, False
 
+        safe_batch_size = max(1, int(batch_size or 1))
         total = len(messages)
         start_idx = offset
-        end_idx = min(offset + batch_size, total)
+        end_idx = min(offset + safe_batch_size, total)
 
         batch_messages = messages[start_idx:end_idx]
         has_more = end_idx < total
 
-        message_text = "\n".join([f"- {msg}" for msg in batch_messages])
+        compact_messages = []
+        max_chars_per_message = 650
+        for msg in batch_messages:
+            row = str(msg or "").strip()
+            if not row:
+                continue
+            if len(row) > max_chars_per_message:
+                row = row[: max_chars_per_message - 1].rstrip() + "…"
+            compact_messages.append(f"- {row}")
+
+        message_text = "\n".join(compact_messages)
+        max_prompt_chars = 14000
+        if len(message_text) > max_prompt_chars:
+            message_text = (
+                message_text[: max_prompt_chars - 50].rstrip()
+                + "\n- ...(đã rút gọn để tránh quá dài trong 1 lượt summary)"
+            )
+
         progress_info = f"Tổng hợp {start_idx + 1}-{end_idx}/{total} tin nhắn"
         if channel_name:
             progress_info += f" từ #{channel_name}"
@@ -2962,8 +3006,8 @@ class KnowledgeBot:
                         "Bạn là trợ lý học tập. Trả về JSON hợp lệ với format:\n"
                         '{"summary_points": ["..."], "detailed_summary": "...", "review_questions": ["..."]}\n'
                         "- summary_points: 6-10 ý chính, rõ ý\n"
-                        "- detailed_summary: phân tích sâu, có cấu trúc, giải thích đủ dài\n"
-                        "- review_questions: 3-5 câu hỏi kiểm tra hiểu bài"
+                        "- detailed_summary: phân tích sâu, có cấu trúc, giải thích đủ dài nhưng <= 2500 ký tự\n"
+                        "- review_questions: 3-5 câu hỏi kiểm tra hiểu bài, mỗi câu <= 180 ký tự"
                     ),
                 },
                 {
@@ -3008,12 +3052,15 @@ class KnowledgeBot:
         review_questions = [str(x).strip() for x in review_questions if str(x).strip()][
             :5
         ]
+        if len(detailed_summary) > 6000:
+            detailed_summary = detailed_summary[:5999].rstrip() + "…"
 
         return {
             "summary_points": summary_points,
             "detailed_summary": detailed_summary,
             "review_questions": review_questions,
             "model": ai_result["model"],
+            "processed_count": len(batch_messages),
         }, has_more
 
     async def expand_summary_analysis(

@@ -274,6 +274,43 @@ def _build_summary_embed(
     channel_name, total_messages, summary_data, question_start_index=1
 ):
     """Build study summary embed and indexed review-question payload."""
+
+    def _clip_field_text(text, max_chars=1024):
+        value = str(text or "").strip()
+        if len(value) <= max_chars:
+            return value
+        clipped = value[: max_chars - 1].rstrip()
+        return clipped + "…"
+
+    def _chunk_field_text(text, chunk_chars=950, max_chunks=3):
+        rows = [str(line).rstrip() for line in str(text or "").splitlines()]
+        rows = [line for line in rows if line.strip()]
+        if not rows:
+            return []
+
+        chunks = []
+        current = ""
+        for line in rows:
+            line_value = line
+            if len(line_value) > chunk_chars:
+                line_value = line_value[: chunk_chars - 1].rstrip() + "…"
+
+            candidate = line_value if not current else f"{current}\n{line_value}"
+            if len(candidate) <= chunk_chars:
+                current = candidate
+                continue
+
+            if current:
+                chunks.append(current)
+            current = line_value
+
+            if len(chunks) >= max_chunks:
+                break
+
+        if current and len(chunks) < max_chunks:
+            chunks.append(current)
+        return chunks
+
     summary_data = summary_data or {}
     summary_points = list(summary_data.get("summary_points") or [])
     questions = list(
@@ -295,15 +332,31 @@ def _build_summary_embed(
     if summary_points:
         summary_lines = [f"• {str(item)}" for item in summary_points[:10]]
         embed.add_field(
-            name="✨ Ý chính", value="\n".join(summary_lines)[:1024], inline=False
+            name="✨ Ý chính",
+            value=_clip_field_text("\n".join(summary_lines)),
+            inline=False,
         )
 
     if detailed_summary:
-        embed.add_field(
-            name="📖 Phân tích sâu (rút gọn)",
-            value=detailed_summary[:1024],
-            inline=False,
+        detail_chunks = _chunk_field_text(
+            detailed_summary, chunk_chars=950, max_chunks=3
         )
+        if not detail_chunks:
+            detail_chunks = [_clip_field_text(detailed_summary, max_chars=950)]
+
+        if len(detail_chunks) == 1:
+            embed.add_field(
+                name="📖 Phân tích sâu (rút gọn)",
+                value=detail_chunks[0],
+                inline=False,
+            )
+        else:
+            for idx, chunk in enumerate(detail_chunks, start=1):
+                embed.add_field(
+                    name=f"📖 Phân tích sâu ({idx}/{len(detail_chunks)})",
+                    value=chunk,
+                    inline=False,
+                )
 
     numbered_questions = []
     if questions:
@@ -318,7 +371,7 @@ def _build_summary_embed(
         if question_lines:
             embed.add_field(
                 name="📝 Câu hỏi ôn tập",
-                value="\n".join(question_lines)[:1024],
+                value=_clip_field_text("\n".join(question_lines)),
                 inline=False,
             )
 
@@ -454,7 +507,13 @@ async def _continue_summary_for_user(user_id):
         )
 
     if has_more:
-        summary_state[channel_id]["offset"] += SUMMARY_BATCH_SIZE
+        processed_count = max(
+            1, int(summary_data.get("processed_count") or SUMMARY_BATCH_SIZE)
+        )
+        summary_state[channel_id]["offset"] = min(
+            len(state["messages"]),
+            int(summary_state[channel_id].get("offset", 0)) + processed_count,
+        )
         remaining = len(state["messages"]) - summary_state[channel_id]["offset"]
         return {
             "ok": True,
@@ -534,6 +593,7 @@ register_prefix_commands(
         "VIETNAM_TZ": VIETNAM_TZ,
         "STUDY_PASS_THRESHOLD": STUDY_PASS_THRESHOLD,
         "STUDY_POINTS_PASS": STUDY_POINTS_PASS,
+        "SUMMARY_BATCH_SIZE": SUMMARY_BATCH_SIZE,
         "daily_messages": daily_messages,
         "summary_state": summary_state,
         "_last_events": _last_events,

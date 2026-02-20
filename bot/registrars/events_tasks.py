@@ -406,13 +406,17 @@ def register_events_and_tasks(bot, deps):
                     await channel.send(embed=embed)
 
                 if has_more:
+                    processed_count = max(
+                        1,
+                        int(summary_data.get("processed_count") or SUMMARY_BATCH_SIZE),
+                    )
                     summary_state[channel_id] = {
                         "messages": messages,
                         "channel_name": channel_name,
-                        "offset": SUMMARY_BATCH_SIZE,
+                        "offset": processed_count,
                     }
                     await channel.send(
-                        f"💡 Còn {len(messages) - SUMMARY_BATCH_SIZE} tin nhắn. Dùng `/continue_summary`"
+                        f"💡 Còn {max(0, len(messages) - processed_count)} tin nhắn. Dùng `/continue_summary`"
                     )
 
         if not summary_state:
@@ -422,6 +426,68 @@ def register_events_and_tasks(bot, deps):
     async def before_evening_summary():
         """Wait until bot is ready before starting evening summary loop."""
         await bot.wait_until_ready()
+
+    def _clip_lines(lines, max_chars=1024):
+        text = "\n".join(
+            [str(x).strip() for x in (lines or []) if str(x).strip()]
+        ).strip()
+        if not text:
+            return "Không có"
+        return text[: max_chars - 1].rstrip() + "…" if len(text) > max_chars else text
+
+    def _build_nightly_gmail_embed(result):
+        date_label = datetime.now(VIETNAM_TZ).strftime("%d/%m/%Y")
+        important = result.get("important_mails", [])
+        unread_items = result.get("unread_items", [])
+        sent_items = result.get("sent_items", [])
+
+        embed = discord.Embed(
+            title=f"📮 Gmail nightly digest - {date_label} (23:30)",
+            description="Tổng hợp nhanh mail quan trọng, TODO ưu tiên và insight từ sent mail.",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(VIETNAM_TZ),
+        )
+        embed.add_field(name="🔥 Important", value=str(len(important)), inline=True)
+        embed.add_field(name="📥 Unread", value=str(len(unread_items)), inline=True)
+        embed.add_field(name="📤 Sent hôm nay", value=str(len(sent_items)), inline=True)
+
+        todo_list = result.get("todo_list", [])
+        todo_lines = []
+        for idx, item in enumerate(todo_list[:8], start=1):
+            todo_lines.append(f"{idx}. {str(item)}")
+        if not todo_lines:
+            todo_lines = ["Không có TODO ưu tiên mới."]
+        embed.add_field(
+            name="✅ Top TODO ưu tiên",
+            value=_clip_lines(todo_lines),
+            inline=False,
+        )
+
+        key_info = result.get("key_info", [])
+        key_info_lines = [f"- {str(x)}" for x in key_info[:8]]
+        if not key_info_lines:
+            key_info_lines = ["Không có thông tin quan trọng nổi bật."]
+        embed.add_field(
+            name="📌 Thông tin quan trọng",
+            value=_clip_lines(key_info_lines),
+            inline=False,
+        )
+
+        sent_actions = result.get("sent_actions_done", [])
+        sent_lines = []
+        sent_summary = str(result.get("sent_summary") or "").strip()
+        if sent_summary:
+            sent_lines.append(f"🧾 {sent_summary}")
+        if sent_actions:
+            sent_lines.extend([f"- {str(x)}" for x in sent_actions[:6]])
+        if not sent_lines:
+            sent_lines = ["Chưa có hành động sent mail đáng chú ý."]
+        embed.add_field(
+            name="🧠 Sent Mail Insight",
+            value=_clip_lines(sent_lines),
+            inline=False,
+        )
+        return embed
 
     @tasks.loop(time=time(hour=23, minute=30, tzinfo=VIETNAM_TZ))
     async def nightly_gmail_digest():
@@ -438,27 +504,7 @@ def register_events_and_tasks(bot, deps):
             await channel.send(result.get("error", "⚠️ Không thể tạo Gmail report."))
             return
 
-        todo_list = result.get("todo_list", [])
-        key_info = result.get("key_info", [])
-        sent_actions = result.get("sent_actions_done", [])
-
-        lines = [
-            f"📮 **Gmail nightly digest - {datetime.now(VIETNAM_TZ).strftime('%d/%m/%Y')} (23:30)**",
-            f"- Important: {len(result.get('important_mails', []))}",
-            f"- Unread: {len(result.get('unread_items', []))}",
-            f"- Sent mail trong ngày: {len(result.get('sent_items', []))}",
-        ]
-        if todo_list:
-            lines.append("\n**Top TODO ưu tiên:**")
-            lines.extend([f"{i+1}. {x}" for i, x in enumerate(todo_list[:5])])
-        if key_info:
-            lines.append("\n**Thông tin quan trọng:**")
-            lines.extend([f"- {x}" for x in key_info[:5]])
-        if sent_actions:
-            lines.append("\n**Việc đã thực hiện qua sent mail:**")
-            lines.extend([f"- {x}" for x in sent_actions[:5]])
-
-        await channel.send("\n".join(lines)[:3900])
+        await channel.send(embed=_build_nightly_gmail_embed(result))
 
     @nightly_gmail_digest.before_loop
     async def before_nightly_gmail_digest():

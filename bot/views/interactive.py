@@ -358,7 +358,7 @@ class SummaryInteractiveView(discord.ui.View):
         numbered_questions,
         has_more=False,
     ):
-        super().__init__(timeout=1800)
+        super().__init__(timeout=43200)
         self.owner_id = owner_id
         self.channel_name = channel_name
         self.summary_data = summary_data or {}

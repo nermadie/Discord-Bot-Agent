@@ -14,6 +14,7 @@ def register_prefix_commands(bot, deps):
     VIETNAM_TZ = deps["VIETNAM_TZ"]
     STUDY_PASS_THRESHOLD = deps["STUDY_PASS_THRESHOLD"]
     STUDY_POINTS_PASS = deps["STUDY_POINTS_PASS"]
+    SUMMARY_BATCH_SIZE = deps.get("SUMMARY_BATCH_SIZE", 20)
 
     daily_messages = deps["daily_messages"]
     summary_state = deps["summary_state"]
@@ -292,7 +293,7 @@ def register_prefix_commands(bot, deps):
                     "• Bot theo dõi tin nhắn trong CHANNELS_TO_MONITOR\n"
                     "• Nếu tin nhắn có ảnh/file, bot sẽ kèm URL/tên file vào dữ liệu summary\n"
                     "• Tự động tổng hợp lúc 21:00 hàng ngày\n"
-                    "• Mỗi lần xử lý 50 tin nhắn\n"
+                    f"• Mỗi lần xử lý {SUMMARY_BATCH_SIZE} tin nhắn\n"
                     "• `!summary` dùng model chính: `openai/gpt-5-chat`"
                 ),
                 inline=False,
@@ -891,7 +892,7 @@ def register_prefix_commands(bot, deps):
             channel_name = discord_channel.name if discord_channel else str(channel_id)
 
             summary_data, has_more = await knowledge_bot.summarize_daily_knowledge(
-                messages, channel_name, 0, 50
+                messages, channel_name, 0, SUMMARY_BATCH_SIZE
             )
 
             if summary_data:
@@ -947,13 +948,17 @@ def register_prefix_commands(bot, deps):
                     question_index += len(numbered_questions)
 
                 if has_more:
+                    processed_count = max(
+                        1,
+                        int(summary_data.get("processed_count") or SUMMARY_BATCH_SIZE),
+                    )
                     summary_state[channel_id] = {
                         "messages": messages,
                         "channel_name": channel_name,
-                        "offset": 50,
+                        "offset": processed_count,
                     }
                     await ctx.send(
-                        f"💡 Còn {len(messages) - 50} tin nhắn chưa summary. Bấm `Continue Summary` ngay dưới embed vừa gửi hoặc dùng `/continue_summary`.",
+                        f"💡 Còn {max(0, len(messages) - processed_count)} tin nhắn chưa summary. Bấm `Continue Summary` ngay dưới embed vừa gửi hoặc dùng `/continue_summary`.",
                     )
 
     @bot.command()
