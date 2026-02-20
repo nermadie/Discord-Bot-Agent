@@ -455,7 +455,7 @@ def register_slash_commands(bot, deps):
         name="summary", description="Tổng hợp học tập và tạo câu hỏi ôn tập"
     )
     @app_commands.describe(
-        mode="cache: dữ liệu lưu trong ngày | channel: fetch 1 kênh | all: quét các kênh có tin mới",
+        mode="cache: dữ liệu lưu trong ngày | channel: fetch 1 kênh | all: quét các kênh có tin mới (bỏ trống sẽ tự suy luận theo option)",
         channel_option="Chọn channel từ danh sách gợi ý (hoặc all)",
         latest_messages="Số tin gần nhất khi fetch (tối đa 20). Bỏ trống ở mode=all để chỉ lấy tin mới trong hôm nay",
     )
@@ -499,8 +499,15 @@ def register_slash_commands(bot, deps):
 
         source_batches = []
         fetch_checkpoints = {}
-        selected_mode = (mode.value if mode else "cache").lower().strip()
         selected_channel_option = (channel_option or "").strip().lower()
+        if mode:
+            selected_mode = mode.value.lower().strip()
+        elif selected_channel_option == "all":
+            selected_mode = "all"
+        elif selected_channel_option or latest_messages is not None:
+            selected_mode = "channel"
+        else:
+            selected_mode = "cache"
 
         def _resolve_channel_by_option(option_text):
             """Resolve channel option text/value from autocomplete into a channel object."""
