@@ -1,291 +1,114 @@
-# 🤖 Discord Agent Bot
+# Discord Agent Bot
 
-> Trợ lý Discord đa năng cho học tập & quản lý công việc: **Calendar + Tasks + Weather + Summary + Chat + Countdown**.
+Bot Discord phục vụ học tập và quản lý công việc với trọng tâm slash commands.
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
-![Discord.py](https://img.shields.io/badge/discord.py-2.x-5865F2)
-![Google APIs](https://img.shields.io/badge/Google-Calendar%20%26%20Tasks-4285F4)
-![Status](https://img.shields.io/badge/Status-Active-success)
+## Tính năng chính
 
----
+- Calendar + Events (Google Calendar)
+- Tasks (Google Tasks)
+- Study Summary (AI) + câu hỏi ôn tập + chấm điểm + streak
+- Chat / Reasoning + xử lý ảnh
+- Weather hiện tại + forecast theo ngày/giờ
+- Slogan động lực tự động khi idle + lệnh thủ công
 
-## ✨ Tính năng chính
+## Cấu trúc dự án (đã tách module)
 
-### 📅 Calendar & Event
-- Xem lịch theo ngày: hôm nay, ngày mai, thứ trong tuần, hoặc ngày cụ thể.
-- Thêm / xóa / dời giờ event nhanh ngay trong Discord.
-- Nhận nhắc nhở event trong ngày **trước 30 phút**.
+- discord_bot.py: entrypoint và orchestration chính
+- bot_modules/constants.py: hằng số dùng chung, giảm magic numbers
+- bot_modules/embed_builders.py: UI embed cho calendar/events/tasks
+- setup_calendar.py: setup OAuth
+- requirements.txt
 
-### 📋 Tasks (Google Tasks)
-- Xem tasks theo ngày hoặc toàn bộ tasks chưa hoàn thành.
-- Tạo task có hạn ngày giờ.
-- Đánh dấu hoàn thành, xóa task.
-- Nhận nhắc nhở task có giờ trong ngày **trước 30 phút**.
+## Cài đặt
 
-### 🌤️ Weather
-- Lấy thời tiết hiện tại tại Đà Nẵng (WeatherAPI).
-- Dùng trong bản tin chào sáng tự động.
+1. Tạo môi trường ảo và cài package
 
-### 📚 Study Summary (AI)
-- Theo dõi tin nhắn tại các channel học tập bạn chọn.
-- Nếu tin nhắn có ảnh/file đính kèm, bot sẽ kèm URL/tên file vào ngữ cảnh gửi model.
-- Tự động tổng hợp nội dung và tạo câu hỏi ôn tập.
-- Trả lời từng câu hỏi bằng `!answer` và nhận đánh giá/nhận xét tự động.
-- Hỗ trợ chia lô (batch) khi lượng tin nhắn lớn.
+   - Windows:
+     - python -m venv .venv
+     - .\.venv\Scripts\activate
+     - pip install -r requirements.txt
 
-### 💬 Chatbot trực tiếp
-- Dùng `!chat <nội dung>` để hỏi đáp trực tiếp với AI (có thể đính kèm ảnh).
-- Dùng `!reason <nội dung>` cho reasoning mode (lọc phần `<think>` trước khi hiển thị).
-- Dùng `!reason --show-thinking <nội dung>` để xổ phần `<think>` (owner + bật env).
-- Hiển thị phản hồi bằng embed đẹp + thông tin model đang dùng.
-- Tự động fallback model nếu model chính bị giới hạn lượt gọi.
-
-### ⏰ Countdown thông minh
-- Tạo countdown sự kiện bất kỳ.
-- Mốc nhắc theo cấu trúc: **5' → 4' → 3' → 2' → 60s ... 0s**.
-- Có tin nhắn kết thúc và có thể mention người dùng cấu hình.
-- Hỗ trợ shortcut countdown cho `!newyear` và `!tet`.
-
-### 🤖 Tự động hóa theo lịch
-- Chào sáng + thời tiết + lịch + tasks.
-- Nhắc lịch / task sắp đến.
-- Review cuối ngày.
-- Tổng hợp học tập buổi tối.
-
----
-
-## 🧱 Cấu trúc dự án
-
-```text
-discord-agent-bot/
-├─ discord_bot.py          # File chính chạy bot
-├─ setup_calendar.py       # Hỗ trợ setup OAuth Google
-├─ requirements.txt        # Danh sách thư viện
-├─ .env                    # Biến môi trường (local, không commit)
-├─ credentials.json        # OAuth client của Google (local, không commit)
-├─ token.json              # Token người dùng Google (local, không commit)
-└─ README.md
-```
-
----
-
-## ⚙️ Yêu cầu hệ thống
-
-- Python 3.10 trở lên
-- Discord Bot Token
-- GitHub Models Token (cho tóm tắt AI)
-- WeatherAPI key
-- Google Calendar API + Google Tasks API đã bật
-
----
-
-## 🚀 Hướng dẫn cài đặt nhanh
-
-## 1) Clone & tạo môi trường ảo
-
-### Windows (PowerShell)
-```powershell
-git clone <repo-url>
-cd discord-agent-bot
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-### macOS/Linux
-```bash
-git clone <repo-url>
-cd discord-agent-bot
-python -m venv .venv
-source .venv/bin/activate
-```
-
-## 2) Cài dependencies
-```bash
-pip install -r requirements.txt
-```
-
-## 3) Tạo file `.env`
-Tạo file `.env` ở thư mục gốc với nội dung mẫu:
+1. Tạo file .env
 
 ```env
-DISCORD_TOKEN=your_discord_bot_token
-GITHUB_TOKEN=your_github_models_token
+DISCORD_TOKEN=...
+GITHUB_TOKEN=...
+WEATHER_API_KEY=...
+YOUR_USER_ID=...
+CHANNEL_MAIN=...
+APP_GUILD_ID=...
 
-# Chat trực tiếp (!chat)
+# Thứ tự trong danh sách này được dùng cho autocomplete /summary channel_option
+# Đặt theo thứ tự mong muốn từ trên xuống, KHÔNG bao gồm CHANNEL_MAIN
+CHANNELS_TO_MONITOR=111111111111111111,222222222222222222,333333333333333333
+
 CHAT_MODEL_PRIMARY=openai/gpt-5
-CHAT_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4.1,openai/gpt-4o
+CHAT_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4o
 
-# Vision/OCR cho ảnh trong chat (!chat, /chat) - xử lý từng ảnh một
 VISION_MODEL_PRIMARY=meta/Llama-4-Maverick-17B-128E-Instruct-FP8
 VISION_MODEL_FALLBACKS=openai/gpt-4.1-nano,openai/gpt-4o-mini
 
-# Tổng hợp học tập (!summary)
 SUMMARY_MODEL_PRIMARY=openai/gpt-5-chat
-SUMMARY_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4.1,openai/gpt-4o
+SUMMARY_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4o
+SUMMARY_MAX_OUTPUT_TOKENS=16000
 
-# Chấm câu trả lời học tập (!answer)
 ANSWER_MODEL_PRIMARY=openai/gpt-5-chat
-ANSWER_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4.1,openai/gpt-4o
+ANSWER_MODEL_FALLBACKS=openai/gpt-5-mini,openai/gpt-5-nano,openai/gpt-4o
 
-# Reasoning mode (!reason, /reason)
 REASONING_MODEL_PRIMARY=deepseek/DeepSeek-R1-0528
 REASONING_MODEL_FALLBACKS=microsoft/Phi-4-reasoning,microsoft/Phi-4-mini-reasoning
-ALLOW_SHOW_REASONING_THINKING=false
 
-# Legacy optional
-GITHUB_MODEL=gpt-4o-mini
+STUDY_POINTS_PASS=10
+STUDY_POINTS_MISS=3
+STUDY_PASS_THRESHOLD=7
+STUDY_METRICS_DIR=study_metrics
 
-WEATHER_API_KEY=your_weatherapi_key
-WEATHER_PROVIDER=weatherapi
-YOUR_USER_ID=123456789012345678
-CHANNEL_MAIN=123456789012345678
-CHANNELS_TO_MONITOR=111111111111111111,222222222222222222
-
-# Optional: sync slash command ngay cho server test
-APP_GUILD_ID=123456789012345678
+SLOGAN_IDLE_MINUTES=180
+SLOGAN_CHECK_INTERVAL_MINUTES=30
 ```
 
-> Bạn cũng có thể copy nhanh từ file `.env.example`.
+1. Chạy bot
 
-> Gợi ý:
-> - `YOUR_USER_ID`: ID Discord của bạn (để giới hạn lệnh nhạy cảm và mention đúng người).
-> - `CHANNEL_MAIN`: channel bot gửi thông báo tự động.
-> - `CHANNELS_TO_MONITOR`: các channel bot thu thập tin nhắn để summary.
+   - python discord_bot.py
 
-## 4) Setup Google Calendar/Tasks OAuth
-1. Truy cập Google Cloud Console.
-2. Tạo Project mới.
-3. Enable:
-   - Google Calendar API
-   - Google Tasks API
-4. Tạo OAuth Client ID (Desktop App).
-5. Tải file JSON và đổi tên thành `credentials.json` đặt ở thư mục gốc.
-6. Chạy setup:
-   ```bash
-   python setup_calendar.py
-   ```
-7. Sau khi auth thành công, file `token.json` sẽ được tạo.
+## Slash commands (chuẩn hoá)
 
-## 5) Chạy bot
-```bash
-python discord_bot.py
-```
+- /help
+- /calendar, /events, /add_event, /del_event, /move_event
+- /tasks, /overdue, /add_task, /done, /del_task
+- /summary, /continue_summary, /answer, /study_stats
+- /chat, /reason
+- /weather
+- /slogan
+- /countdown, /add_countdown, /del_countdown, /newyear, /tet
 
----
+## Summary modes
 
-## 🔐 Bảo mật
-
-Các file sau **không được commit**:
-- `.env`
-- `credentials.json`
-- `token.json`
-
-Dự án đã có `.gitignore` để tự động chặn các file này.
-
----
-
-## 🕹️ Nhóm lệnh chính
-
-## `!help`
-- `!help`: danh sách tổng quan
-- `!help calendar|tasks|countdown|weather|study|chatbot|automation`
-
-## Slash Commands (`/`)
-- Bot hỗ trợ slash commands để Discord tự hiện **Command Matching** như giao diện bạn mong muốn.
-- Lệnh chính: `/calendar`, `/events`, `/tasks`, `/countdown`, `/chat`, `/reason`, `/summary`, `/answer`, `/weather`, `/ping`, `/help`.
-- Để slash command hiện ngay (không phải chờ global cache), set `APP_GUILD_ID` trong `.env` rồi restart bot.
-
-## Calendar
-- `!calendar [date]`
-- `!events [date]`
-- `!add_event <title> | <date time-end> | <desc>`
-- `!del_event <index>`
-- `!move_event <index> | <date time>`
-
-## Tasks
-- `!tasks [date]`
-- `!overdue`
-- `!add_task <title> | <date time> | <notes>`
-- `!done <index>`
-- `!del_task <index>`
-
-## Study
-- `!summary`
-- `!continue`
-- `!answer <số câu> | <câu trả lời>`
-- `!stats`
-
-## Chatbot
-- `!chat <câu hỏi của bạn>`
-- `!chat <câu hỏi> + đính kèm 1-n ảnh` (bot tự trích xuất nội dung từng ảnh rồi trả lời)
-- `!reason <câu hỏi/bài toán cần reasoning>`
-
-## Slash Chatbot
-- `/chat` với các trường ảnh `image_1`, `image_2`, `image_3`, `image_4`
-- `/reason` (có tuỳ chọn `show_thinking`)
+- /summary mode=cache
+  - Dùng dữ liệu tin nhắn tạm trong ngày
+- /summary mode=channel channel_option=<id-kênh-từ-autocomplete> latest_messages=<1..20>
+  - Fetch trực tiếp N tin gần nhất của channel đó để summary
+- /summary mode=all
+  - Nếu bỏ latest_messages: chỉ lấy tin mới trong hôm nay
+  - Nếu có latest_messages: có thể summary lịch sử gần nhất của mỗi channel monitor
 
 ## Weather
-- `!weather`
 
-## Countdown
-- `!countdown`
-- `!add_countdown <name> | <date time> | <emoji>`
-- `!del_countdown <name>`
-- `!newyear [year month day hour minute]`
-- `!tet`
+- /weather (hiện tại)
+- /weather date:tomorrow
+- /weather date:18/2 hour:14:00
 
-## Utility
-- `!ping`
+## Lưu ý quan trọng
 
----
+- Dữ liệu summary trong ngày không bị xoá khi chạy /summary; chỉ reset sang ngày mới.
+- Nếu muốn slash command cập nhật nhanh trong server test, set APP_GUILD_ID.
+- Nếu IDE báo thiếu import, kiểm tra đúng .venv và pip install -r requirements.txt.
 
-## ⏱️ Lịch tự động hiện có
+## Gợi ý mở rộng state-of-the-art
 
-- **06:30**: chào sáng + thời tiết + lịch + task
-- **Mỗi 1 phút**: kiểm tra nhắc event/task trong vòng 30 phút tới
-- **20:00**: review task cuối ngày
-- **21:00**: tổng hợp học tập
-- **Mỗi giây**: kiểm tra countdown
-
----
-
-## 🧠 Ghi chú vận hành
-
-- Bot dùng timezone `Asia/Ho_Chi_Minh` cho xử lý lịch.
-- Nếu thấy import lỗi trong editor, kiểm tra bạn đã activate đúng `.venv` và cài đủ package chưa.
-- Nếu bot không gửi nhắc tự động:
-  - Kiểm tra `CHANNEL_MAIN`
-  - Kiểm tra bot có quyền gửi tin nhắn tại channel
-  - Kiểm tra token/API key hợp lệ
-
----
-
-## 🧪 Checklist test nhanh
-
-1. `!ping` để kiểm tra bot online.
-2. `!weather` để kiểm tra Weather API.
-3. `!events` và `!tasks` để kiểm tra kết nối Google.
-4. Tạo event/task sắp tới trong vòng 30 phút để kiểm tra reminder.
-5. `!add_countdown Test | today 23:59 | 🎯` để kiểm tra countdown.
-6. `!chat Giải thích OAuth2 là gì` để kiểm tra chat model + fallback.
-7. `!summary` rồi `!answer 1 | ...` để kiểm tra cơ chế hỏi đáp ôn tập.
-
----
-
-## 📌 Roadmap gợi ý
-
-- Thêm logging chuẩn file + mức log.
-- Thêm Dockerfile để deploy dễ hơn.
-- Tách module lớn trong `discord_bot.py` để dễ bảo trì.
-
----
-
-## 👤 Đóng góp
-
-- Tạo branch mới từ `main`
-- Commit nhỏ, rõ mục tiêu
-- Mở Pull Request kèm mô tả test đã chạy
-
----
-
-Nếu bạn muốn, mình có thể tách riêng module chatbot/summary thành file độc lập để dễ maintain hơn.
+- Adaptive learning path: đề xuất lộ trình học theo điểm yếu theo tuần
+- Spaced repetition: tạo lịch ôn tập theo thuật toán quên (SM-2)
+- Semantic memory: vector store cho ngữ cảnh học dài hạn
+- Multi-agent workflow: agent tóm tắt + phản biện + tạo quiz
+- Progress dashboard web: weekly/monthly analytics, heatmap, goals
+- Smart nudges: nhắc học cá nhân hoá theo giờ hoạt động thực tế

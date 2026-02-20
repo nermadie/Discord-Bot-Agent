@@ -7,11 +7,26 @@ from datetime import datetime, time, timedelta, timezone
 import pytz
 import aiohttp
 import json
+import sqlite3
+import random
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 from dotenv import load_dotenv
 import re
+
+from tools.constants import (
+    SUMMARY_BATCH_SIZE,
+    SUMMARY_FETCH_MAX_MESSAGES,
+    WEATHER_DEFAULT_LOCATION,
+    WEATHER_FORECAST_MAX_DAYS,
+)
+from tools.embed_builders import (
+    build_calendar_embed,
+    build_events_embed,
+    build_tasks_embed,
+)
+from tools import study_memory
 
 
 load_dotenv()
@@ -65,10 +80,17 @@ REASONING_MODEL_FALLBACKS = _parse_model_fallbacks(
 )
 
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "0"))
+SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("SUMMARY_MAX_OUTPUT_TOKENS", "16000"))
 AI_REQUEST_TIMEOUT_SECONDS = int(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "45"))
 REASONING_REQUEST_TIMEOUT_SECONDS = int(
     os.getenv("REASONING_REQUEST_TIMEOUT_SECONDS", "90")
 )
+STUDY_POINTS_PASS = int(os.getenv("STUDY_POINTS_PASS", "10"))
+STUDY_POINTS_MISS = int(os.getenv("STUDY_POINTS_MISS", "3"))
+STUDY_PASS_THRESHOLD = float(os.getenv("STUDY_PASS_THRESHOLD", "7"))
+STUDY_METRICS_DIR = os.getenv("STUDY_METRICS_DIR", "study_metrics")
+SLOGAN_IDLE_MINUTES = int(os.getenv("SLOGAN_IDLE_MINUTES", "180"))
+SLOGAN_CHECK_INTERVAL_MINUTES = int(os.getenv("SLOGAN_CHECK_INTERVAL_MINUTES", "30"))
 
 CHANNELS_TO_MONITOR_STR = os.getenv("CHANNELS_TO_MONITOR", "")
 CHANNELS_TO_MONITOR = [
@@ -84,7 +106,7 @@ VIETNAM_TZ = timezone(timedelta(hours=7))
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 bot.remove_command("help")
 
 
@@ -98,11 +120,610 @@ _sent_upcoming_reminders = set()
 _study_questions = {}
 _chat_sessions = {}
 _pending_chat_context = {}
+_daily_messages_date = None
+_last_interaction_at = {}
+_last_slogan_sent_at = {}
+_last_summary_fetch_message_ids = {}
+
+
+def _get_summary_channel_option_items():
+    items = [("All monitored channels", "all")]
+    for channel_id in CHANNELS_TO_MONITOR:
+        if channel_id == MAIN_CHANNEL_ID:
+            continue
+        channel = bot.get_channel(channel_id)
+        label = f"#{channel.name}" if channel else f"channel-{channel_id}"
+        items.append((label, str(channel_id)))
+    return items
+
+
+async def summary_channel_autocomplete(interaction: discord.Interaction, current: str):
+    current_text = (current or "").lower().strip()
+    choices = []
+    for name, value in _get_summary_channel_option_items():
+        if not current_text or current_text in name.lower() or current_text in value:
+            choices.append(app_commands.Choice(name=name, value=value))
+    return choices[:25]
+
+
+def _today_vn_date():
+    return datetime.now(VIETNAM_TZ).date()
+
+
+def _ensure_daily_window_rollover():
+    global _daily_messages_date
+    today = _today_vn_date()
+    if _daily_messages_date is None:
+        _daily_messages_date = today
+        return
+    if _daily_messages_date != today:
+        daily_messages.clear()
+        summary_state.clear()
+        _sent_upcoming_reminders.clear()
+        _daily_messages_date = today
+
+
+def _mark_user_interaction(user_id):
+    _last_interaction_at[int(user_id)] = datetime.now(VIETNAM_TZ)
+
+
+def _build_study_status_text(user_id):
+    profile = _get_or_create_study_profile(user_id)
+    return (
+        "📈 **Tình hình học tập hôm nay**\n"
+        f"• ⭐ Điểm: **{profile.get('total_points', 0)}**\n"
+        f"• 🔥 Streak: **{profile.get('streak_days', 0)} ngày**\n"
+        f"• ✅ Trả lời đạt: **{profile.get('passed_count', 0)}**\n"
+        f"• ❌ Bỏ lỡ: **{profile.get('missed_count', 0)}**"
+    )
+
+
+async def _fetch_motivational_slogan():
+    fallback = [
+        "Hôm nay khó một chút, ngày mai bạn mạnh hơn rất nhiều.",
+        "Mỗi lần học thêm 1%, bạn đang vượt qua phiên bản cũ của mình.",
+        "Không cần hoàn hảo, chỉ cần đều đặn.",
+        "Đi chậm vẫn hơn đứng yên.",
+        "Kỷ luật hôm nay là tự do ngày mai.",
+    ]
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=8)
+        ) as session:
+            async with session.get("https://zenquotes.io/api/random") as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list) and data:
+                        quote = str(data[0].get("q", "")).strip()
+                        author = str(data[0].get("a", "")).strip()
+                        if quote:
+                            return f"{quote} — {author}" if author else quote
+    except Exception:
+        pass
+
+    return random.choice(fallback)
+
+
+async def _collect_channel_messages_for_summary(channel, latest_messages=50):
+    limit = max(1, min(int(latest_messages or 50), 500))
+    collected = []
+    async for msg in channel.history(limit=limit):
+        if msg.author.bot:
+            continue
+        created_local = msg.created_at.astimezone(VIETNAM_TZ)
+        timestamp = created_local.strftime("%H:%M")
+        attachment_context = _attachment_context_for_summary(msg)
+        collected.append(
+            f"[{timestamp}] {msg.author.name}: {msg.content}{attachment_context}"
+        )
+    collected.reverse()
+    return collected
+
+
+async def _collect_new_messages_since(
+    channel,
+    after_message_id=None,
+    latest_messages=SUMMARY_FETCH_MAX_MESSAGES,
+    only_today=False,
+):
+    limit = max(
+        1,
+        min(
+            int(latest_messages or SUMMARY_FETCH_MAX_MESSAGES),
+            SUMMARY_FETCH_MAX_MESSAGES,
+        ),
+    )
+    kwargs = {"limit": 500}
+    if after_message_id:
+        kwargs["after"] = discord.Object(id=int(after_message_id))
+
+    rows = []
+    today_vn = _today_vn_date()
+    async for msg in channel.history(**kwargs):
+        if msg.author.bot:
+            continue
+
+        created_local = msg.created_at.astimezone(VIETNAM_TZ)
+        if only_today and created_local.date() != today_vn:
+            if created_local.date() < today_vn:
+                break
+            continue
+
+        timestamp = created_local.strftime("%H:%M")
+        attachment_context = _attachment_context_for_summary(msg)
+        rows.append(
+            {
+                "id": int(msg.id),
+                "text": f"[{timestamp}] {msg.author.name}: {msg.content}{attachment_context}",
+            }
+        )
+
+    rows.sort(key=lambda x: x["id"])
+    if len(rows) > limit:
+        rows = rows[-limit:]
+
+    messages = [item["text"] for item in rows]
+    newest_id = rows[-1]["id"] if rows else None
+    return messages, newest_id
+
+
+def _metrics_dir_path():
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, STUDY_METRICS_DIR)
+
+
+def _metrics_db_path(target_date=None):
+    target_date = target_date or datetime.now(VIETNAM_TZ)
+    month_key = target_date.strftime("%Y-%m")
+    return os.path.join(_metrics_dir_path(), f"study_metrics_{month_key}.sqlite3")
+
+
+def _ensure_metrics_db(target_date=None):
+    os.makedirs(_metrics_dir_path(), exist_ok=True)
+    db_path = _metrics_db_path(target_date)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS study_profile (
+            user_id INTEGER PRIMARY KEY,
+            total_points INTEGER NOT NULL DEFAULT 0,
+            streak_days INTEGER NOT NULL DEFAULT 0,
+            last_streak_date TEXT,
+            answered_count INTEGER NOT NULL DEFAULT 0,
+            passed_count INTEGER NOT NULL DEFAULT 0,
+            missed_count INTEGER NOT NULL DEFAULT 0,
+            summaries_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS study_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            points_delta INTEGER NOT NULL DEFAULT 0,
+            question_index INTEGER,
+            channel_name TEXT,
+            score REAL,
+            note TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def _get_or_create_study_profile(user_id, target_date=None):
+    db_path = _ensure_metrics_db(target_date)
+    now_iso = datetime.now(VIETNAM_TZ).isoformat()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM study_profile WHERE user_id = ?", (int(user_id),))
+    row = cur.fetchone()
+    if row is None:
+        cur.execute(
+            """
+            INSERT INTO study_profile (
+                user_id, total_points, streak_days, last_streak_date,
+                answered_count, passed_count, missed_count, summaries_count, updated_at
+            ) VALUES (?, 0, 0, NULL, 0, 0, 0, 0, ?)
+            """,
+            (int(user_id), now_iso),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM study_profile WHERE user_id = ?", (int(user_id),))
+        row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def _update_streak(profile, event_dt):
+    profile = dict(profile or {})
+    event_date = event_dt.date()
+    last_date_str = profile.get("last_streak_date")
+    current_streak = int(profile.get("streak_days") or 0)
+
+    if not last_date_str:
+        return 1, event_date.isoformat()
+
+    try:
+        last_date = datetime.fromisoformat(str(last_date_str)).date()
+    except Exception:
+        return 1, event_date.isoformat()
+
+    delta_days = (event_date - last_date).days
+    if delta_days == 0:
+        return current_streak, last_date_str
+    if delta_days == 1:
+        return max(0, current_streak) + 1, event_date.isoformat()
+    return 1, event_date.isoformat()
+
+
+def _append_study_event(
+    user_id,
+    event_type,
+    points_delta=0,
+    question_index=None,
+    channel_name="",
+    score=None,
+    note="",
+    target_date=None,
+):
+    db_path = _ensure_metrics_db(target_date)
+    now_dt = datetime.now(VIETNAM_TZ)
+    now_iso = now_dt.isoformat()
+    profile = _get_or_create_study_profile(user_id, target_date)
+
+    total_points = int(profile.get("total_points") or 0) + int(points_delta)
+    answered_count = int(profile.get("answered_count") or 0)
+    passed_count = int(profile.get("passed_count") or 0)
+    missed_count = int(profile.get("missed_count") or 0)
+    summaries_count = int(profile.get("summaries_count") or 0)
+
+    if event_type == "answer":
+        answered_count += 1
+    elif event_type == "pass":
+        answered_count += 1
+        passed_count += 1
+    elif event_type == "missed":
+        missed_count += 1
+    elif event_type == "summary":
+        summaries_count += 1
+
+    streak_days, last_streak_date = _update_streak(profile, now_dt)
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO study_events (
+            user_id, event_type, points_delta, question_index,
+            channel_name, score, note, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            str(event_type),
+            int(points_delta),
+            question_index,
+            (channel_name or "")[:200],
+            score,
+            (note or "")[:1000],
+            now_iso,
+        ),
+    )
+    cur.execute(
+        """
+        UPDATE study_profile
+        SET total_points = ?, streak_days = ?, last_streak_date = ?,
+            answered_count = ?, passed_count = ?, missed_count = ?,
+            summaries_count = ?, updated_at = ?
+        WHERE user_id = ?
+        """,
+        (
+            total_points,
+            int(streak_days),
+            last_streak_date,
+            answered_count,
+            passed_count,
+            missed_count,
+            summaries_count,
+            now_iso,
+            int(user_id),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    return {
+        "total_points": total_points,
+        "streak_days": int(streak_days),
+        "answered_count": answered_count,
+        "passed_count": passed_count,
+        "missed_count": missed_count,
+        "summaries_count": summaries_count,
+        "db_path": db_path,
+    }
+
+
+def _normalize_score_value(score):
+    if score is None:
+        return None
+    try:
+        return float(str(score).replace(",", ".").strip())
+    except Exception:
+        return None
+
+
+def _mark_question_answered(user_id, question_index):
+    question_bank = _study_questions.get(user_id, [])
+    target = next((q for q in question_bank if q.get("index") == question_index), None)
+    if target:
+        target["answered"] = True
+    return target
+
+
+def _apply_unanswered_penalty(user_id):
+    question_bank = list(_study_questions.get(user_id, []))
+    unanswered = [q for q in question_bank if not q.get("answered")]
+    if not unanswered:
+        return {"applied": False, "count": 0, "points_delta": 0}
+
+    _mark_spaced_unanswered(user_id, unanswered)
+
+    penalty_each = abs(int(STUDY_POINTS_MISS))
+    points_delta = -(penalty_each * len(unanswered))
+    stats = _append_study_event(
+        user_id=user_id,
+        event_type="missed",
+        points_delta=points_delta,
+        note=f"Bỏ lỡ {len(unanswered)} câu hỏi ôn tập chưa trả lời.",
+    )
+    return {
+        "applied": True,
+        "count": len(unanswered),
+        "points_delta": points_delta,
+        "stats": stats,
+    }
+
+
+def _build_study_metrics_embed(user_id, username):
+    profile = _get_or_create_study_profile(user_id)
+    month_label = datetime.now(VIETNAM_TZ).strftime("%m/%Y")
+
+    embed = discord.Embed(
+        title="🔥 Study Streak",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(VIETNAM_TZ),
+    )
+    embed.add_field(name="👤 User", value=str(username), inline=True)
+    embed.add_field(name="🗓️ Tháng", value=month_label, inline=True)
+    embed.add_field(
+        name="⭐ Điểm", value=str(profile.get("total_points", 0)), inline=True
+    )
+    embed.add_field(
+        name="🔥 Streak", value=f"{profile.get('streak_days', 0)} ngày", inline=True
+    )
+    embed.add_field(
+        name="✅ Trả lời đạt", value=str(profile.get("passed_count", 0)), inline=True
+    )
+    embed.add_field(
+        name="🧪 Tổng trả lời", value=str(profile.get("answered_count", 0)), inline=True
+    )
+    embed.add_field(
+        name="❌ Bỏ lỡ", value=str(profile.get("missed_count", 0)), inline=True
+    )
+    embed.add_field(
+        name="📚 Lần summary", value=str(profile.get("summaries_count", 0)), inline=True
+    )
+    embed.set_footer(text=f"DB: {_metrics_db_path()}")
+    return embed
+
+
+def _ensure_study_memory_tables():
+    db_path = _metrics_db_path()
+    study_memory.ensure_study_tables(db_path)
+    return db_path
+
+
+def _build_question_theory_text(summary_points, detailed_summary):
+    points = [str(item).strip() for item in (summary_points or []) if str(item).strip()]
+    theory = str(detailed_summary or "").strip()
+    lines = []
+    if points:
+        lines.append("Ý chính:")
+        lines.extend([f"- {item}" for item in points[:10]])
+    if theory:
+        lines.append("Phân tích:")
+        lines.append(theory[:3000])
+    return "\n".join(lines).strip()
+
+
+def _persist_questions_for_spaced_repetition(
+    user_id, channel_name, summary_data, numbered_questions
+):
+    if not numbered_questions:
+        return
+
+    db_path = _ensure_study_memory_tables()
+    theory_text = _build_question_theory_text(
+        summary_data.get("summary_points", []),
+        summary_data.get("detailed_summary", ""),
+    )
+    topic = (channel_name or "").strip().lower()
+
+    for item in numbered_questions:
+        question_text = str(item.get("question", "")).strip()
+        if not question_text:
+            continue
+        study_memory.upsert_card(
+            db_path=db_path,
+            user_id=int(user_id),
+            channel_name=channel_name,
+            question=question_text,
+            theory=theory_text,
+            topic=topic,
+        )
+
+
+def _record_spaced_review(
+    user_id, target_question, score_value, answered=True, note=""
+):
+    db_path = _ensure_study_memory_tables()
+    return study_memory.record_review(
+        db_path=db_path,
+        user_id=int(user_id),
+        channel_name=str(target_question.get("channel_name", "")),
+        question=str(target_question.get("question", "")),
+        theory=str(target_question.get("theory", "")),
+        score=score_value,
+        answered=answered,
+        note=note,
+    )
+
+
+def _mark_spaced_unanswered(user_id, unanswered_items):
+    db_path = _ensure_study_memory_tables()
+    study_memory.mark_unanswered_cards(
+        db_path=db_path,
+        user_id=int(user_id),
+        pending_items=unanswered_items,
+    )
 
 
 def _split_text_chunks(text, chunk_size=1800):
     content = str(text or "")
     return [content[i : i + chunk_size] for i in range(0, len(content), chunk_size)]
+
+
+def _is_table_like_line(line):
+    s = str(line or "").strip()
+    if not s:
+        return False
+    if s.count("|") >= 2:
+        return True
+    return bool(re.match(r"^[\s\-|:]{6,}$", s))
+
+
+def _split_table_cells(line):
+    s = str(line or "").strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [cell.strip() for cell in s.split("|")]
+
+
+def _is_separator_row(cells):
+    if not cells:
+        return False
+    normalized = [re.sub(r"\s+", "", str(c)) for c in cells]
+    if not any(normalized):
+        return False
+    return all(bool(re.fullmatch(r"[-:]+", c or "")) for c in normalized if c != "")
+
+
+def _render_table_block(lines):
+    rows = [_split_table_cells(line) for line in (lines or []) if str(line).strip()]
+    rows = [row for row in rows if any(str(c).strip() for c in row)]
+    if not rows:
+        return "\n".join(lines)
+
+    rows = [row for row in rows if not _is_separator_row(row)]
+    if len(rows) < 2:
+        return "\n".join(lines)
+
+    col_count = max(len(row) for row in rows)
+    normalized_rows = [row + [""] * (col_count - len(row)) for row in rows]
+    widths = []
+    for idx in range(col_count):
+        widths.append(max(len(str(row[idx])) for row in normalized_rows))
+
+    def format_row(row):
+        return (
+            "| "
+            + " | ".join(str(row[idx]).ljust(widths[idx]) for idx in range(col_count))
+            + " |"
+        )
+
+    header = format_row(normalized_rows[0])
+    sep = (
+        "| " + " | ".join("-" * max(3, widths[idx]) for idx in range(col_count)) + " |"
+    )
+    body = [format_row(row) for row in normalized_rows[1:]]
+
+    return "```text\n" + "\n".join([header, sep] + body) + "\n```"
+
+
+def _stylize_line(line):
+    raw = str(line or "")
+    stripped = raw.strip()
+    if not stripped:
+        return raw
+
+    heading_match = re.match(r"^#{1,6}\s+(.+)$", stripped)
+    if heading_match:
+        title = heading_match.group(1).strip()
+        return f"**{title}**"
+
+    if (
+        re.match(r"^\d+\.\s+.+$", stripped)
+        and "|" not in stripped
+        and len(stripped) <= 120
+    ):
+        return f"**{stripped}**"
+
+    if stripped.endswith(":") and len(stripped) <= 100 and "|" not in stripped:
+        return f"***{stripped}***"
+
+    if re.search(r"\b(ví dụ|example)\b", stripped, flags=re.IGNORECASE):
+        return f"*{stripped}*"
+
+    return raw
+
+
+def _format_rich_text_for_discord(text):
+    content = str(text or "").strip()
+    if not content:
+        return ""
+
+    segments = re.split(r"(```[\s\S]*?```)", content)
+    output_segments = []
+
+    for segment in segments:
+        if not segment:
+            continue
+        if segment.startswith("```") and segment.endswith("```"):
+            output_segments.append(segment)
+            continue
+
+        lines = segment.splitlines()
+        out_lines = []
+        idx = 0
+        while idx < len(lines):
+            if _is_table_like_line(lines[idx]):
+                start = idx
+                while idx < len(lines) and _is_table_like_line(lines[idx]):
+                    idx += 1
+                block = lines[start:idx]
+                if len(block) >= 2:
+                    out_lines.append(_render_table_block(block))
+                else:
+                    out_lines.extend([_stylize_line(item) for item in block])
+                continue
+
+            out_lines.append(_stylize_line(lines[idx]))
+            idx += 1
+
+        output_segments.append("\n".join(out_lines).strip())
+
+    return "\n\n".join([item for item in output_segments if item]).strip()
 
 
 def _build_reason_single_message(prompt, answer_text, model_used):
@@ -212,7 +833,12 @@ def _build_summary_embed(
 ):
     summary_data = summary_data or {}
     summary_points = list(summary_data.get("summary_points") or [])
-    questions = list(summary_data.get("study_questions") or [])
+    questions = list(
+        summary_data.get("review_questions")
+        or summary_data.get("study_questions")
+        or []
+    )
+    detailed_summary = str(summary_data.get("detailed_summary") or "").strip()
     model_used = summary_data.get("model") or "unknown"
 
     embed = discord.Embed(
@@ -224,10 +850,17 @@ def _build_summary_embed(
     embed.add_field(name="🤖 Model", value=str(model_used), inline=True)
 
     if summary_points:
-        summary_lines = [f"• {str(item)}" for item in summary_points[:8]]
+        summary_lines = [f"• {str(item)}" for item in summary_points[:10]]
         embed.add_field(
             name="✨ Ý chính",
             value="\n".join(summary_lines)[:1024],
+            inline=False,
+        )
+
+    if detailed_summary:
+        embed.add_field(
+            name="📖 Phân tích sâu (rút gọn)",
+            value=detailed_summary[:1024],
             inline=False,
         )
 
@@ -250,6 +883,38 @@ def _build_summary_embed(
 
     embed.set_footer(text=f"Model: {model_used}")
     return embed, numbered_questions
+
+
+def _build_study_context_text(channel_name, summary_data, numbered_questions=None):
+    numbered_questions = numbered_questions or []
+    summary_points = list(summary_data.get("summary_points") or [])
+    detailed_summary = str(summary_data.get("detailed_summary") or "").strip()
+
+    lines = [f"Ngữ cảnh học tập từ #{channel_name}:"]
+    if summary_points:
+        lines.append("Ý chính:")
+        lines.extend([f"- {item}" for item in summary_points])
+
+    if detailed_summary:
+        lines.append("Phân tích sâu:")
+        lines.append(detailed_summary)
+
+    if numbered_questions:
+        lines.append("Câu hỏi ôn tập:")
+        for item in numbered_questions:
+            lines.append(f"- Câu {item['index']}: {item['question']}")
+
+    lines.append(
+        "Hãy trả lời câu hỏi tiếp theo của người dùng dựa trên ngữ cảnh này, ưu tiên giải thích rõ và có ví dụ."
+    )
+    return "\n".join(lines)
+
+
+def _build_detailed_summary_text(channel_name, summary_data):
+    detailed_summary = str(summary_data.get("detailed_summary") or "").strip()
+    if not detailed_summary:
+        return ""
+    return f"📖 **Phân tích sâu #{channel_name}:**\n{detailed_summary}"
 
 
 SCOPES = [
@@ -865,27 +1530,102 @@ class KnowledgeBot:
     # --------------------------
     # WEATHER (simplified)
     # --------------------------
-    async def get_weather(self):
-        """Thời tiết hiện tại"""
+    async def get_weather(self, target_date=None, target_time=None):
+        """Thời tiết hiện tại hoặc forecast theo ngày/giờ"""
         try:
-            url = f"http://api.weatherapi.com/v1/forecast.json?key={WEATHER_API_KEY}&q=Da Nang&days=1&lang=vi&aqi=no"
+            now_local = datetime.now(self.timezone)
+            date_to_use = target_date or now_local.date()
+            day_delta = (date_to_use - now_local.date()).days
+
+            if day_delta < 0:
+                return "⚠️ Không hỗ trợ xem weather quá khứ."
+            if day_delta >= WEATHER_FORECAST_MAX_DAYS:
+                return (
+                    f"⚠️ Chỉ hỗ trợ dự báo trong {WEATHER_FORECAST_MAX_DAYS} ngày tới."
+                )
+
+            forecast_days = max(1, day_delta + 1)
+            url = (
+                "http://api.weatherapi.com/v1/forecast.json"
+                f"?key={WEATHER_API_KEY}"
+                f"&q={WEATHER_DEFAULT_LOCATION}"
+                f"&days={forecast_days}"
+                "&lang=vi&aqi=no"
+            )
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as response:
                     if response.status != 200:
                         return "⚠️ Không thể lấy thời tiết"
                     data = await response.json()
 
-            current = data["current"]
-            forecast_day = data["forecast"]["forecastday"][0]
-
-            result = f"🌤️ **Thời tiết Đà Nẵng**\n\n"
-            result += f"🌡️ {current['temp_c']}°C (cảm giác {current['feelslike_c']}°C)\n"
-            result += f"☁️ {current['condition']['text']}\n"
-            result += f"💧 Độ ẩm: {current['humidity']}%\n"
-            result += f"💨 Gió: {current['wind_kph']} km/h\n"
-            result += (
-                f"🌧️ Khả năng mưa: {forecast_day['day']['daily_chance_of_rain']}%\n"
+            forecast_days_data = data.get("forecast", {}).get("forecastday", [])
+            selected_day = next(
+                (
+                    d
+                    for d in forecast_days_data
+                    if str(d.get("date", "")) == date_to_use.strftime("%Y-%m-%d")
+                ),
+                None,
             )
+            if not selected_day:
+                return "⚠️ Không có dữ liệu dự báo cho ngày được chọn."
+
+            title_date = date_to_use.strftime("%d/%m/%Y")
+            if target_date is None and target_time is None:
+                current = data["current"]
+                result = f"🌤️ **Thời tiết {WEATHER_DEFAULT_LOCATION} (hiện tại)**\n\n"
+                result += f"🗓️ {title_date}\n"
+                result += (
+                    f"🌡️ {current['temp_c']}°C "
+                    f"(cảm giác {current['feelslike_c']}°C)\n"
+                )
+                result += f"☁️ {current['condition']['text']}\n"
+                result += f"💧 Độ ẩm: {current['humidity']}%\n"
+                result += f"💨 Gió: {current['wind_kph']} km/h\n"
+                result += (
+                    f"🌧️ Khả năng mưa: {selected_day['day']['daily_chance_of_rain']}%\n"
+                )
+                return result
+
+            if target_time is not None:
+                target_hour = int(target_time.hour)
+                hourly_list = selected_day.get("hour", [])
+                matched_hour = next(
+                    (
+                        hour_data
+                        for hour_data in hourly_list
+                        if str(hour_data.get("time", "")).endswith(
+                            f" {target_hour:02d}:00"
+                        )
+                    ),
+                    None,
+                )
+                if not matched_hour and hourly_list:
+                    matched_hour = hourly_list[min(target_hour, len(hourly_list) - 1)]
+
+                if not matched_hour:
+                    return "⚠️ Không có dữ liệu theo giờ cho ngày được chọn."
+
+                result = f"🌦️ **Forecast {WEATHER_DEFAULT_LOCATION}**\n\n"
+                result += f"🗓️ {title_date} - {target_hour:02d}:00\n"
+                result += f"🌡️ {matched_hour.get('temp_c')}°C\n"
+                result += f"☁️ {matched_hour.get('condition', {}).get('text', '')}\n"
+                result += f"💧 Độ ẩm: {matched_hour.get('humidity')}%\n"
+                result += f"💨 Gió: {matched_hour.get('wind_kph')} km/h\n"
+                result += f"🌧️ Khả năng mưa: {matched_hour.get('chance_of_rain', 0)}%\n"
+                return result
+
+            day = selected_day.get("day", {})
+            astro = selected_day.get("astro", {})
+            result = (
+                f"🌤️ **Forecast ngày {title_date} - {WEATHER_DEFAULT_LOCATION}**\n\n"
+            )
+            result += f"🌡️ {day.get('mintemp_c')}°C - {day.get('maxtemp_c')}°C\n"
+            result += f"☁️ {day.get('condition', {}).get('text', '')}\n"
+            result += f"🌧️ Khả năng mưa: {day.get('daily_chance_of_rain', 0)}%\n"
+            result += f"💨 Gió tối đa: {day.get('maxwind_kph', 0)} km/h\n"
+            result += f"🌅 Mặt trời mọc: {astro.get('sunrise', 'N/A')}\n"
+            result += f"🌇 Mặt trời lặn: {astro.get('sunset', 'N/A')}\n"
             return result
         except Exception as e:
             return f"⚠️ Lỗi: {str(e)}"
@@ -1425,20 +2165,28 @@ class KnowledgeBot:
                     "role": "system",
                     "content": (
                         "Bạn là trợ lý học tập. Trả về JSON hợp lệ với format:\n"
-                        '{"summary_points": ["..."], "review_questions": ["..."]}\n'
-                        "- summary_points: 3-5 ý ngắn gọn\n"
+                        '{"summary_points": ["..."], "detailed_summary": "...", "review_questions": ["..."]}\n'
+                        "- summary_points: 6-10 ý chính, rõ ý\n"
+                        "- detailed_summary: phân tích sâu, có cấu trúc, giải thích đủ dài\n"
                         "- review_questions: 3-5 câu hỏi kiểm tra hiểu bài"
                     ),
                 },
                 {
                     "role": "user",
-                    "content": f"{progress_info}\n\n{message_text}",
+                    "content": (
+                        f"{progress_info}\n\n{message_text}\n\n"
+                        "Yêu cầu đầu ra chi tiết:"
+                        "\n1) Tóm tắt đầy đủ kiến thức chính, tránh quá ngắn."
+                        "\n2) Phần detailed_summary phải có tiêu đề nhỏ theo chủ đề,"
+                        " nêu khái niệm, quy trình, ví dụ, lỗi thường gặp nếu có."
+                        "\n3) Viết bằng tiếng Việt rõ ràng, dễ học lại."
+                    ),
                 },
             ],
             primary_model=SUMMARY_MODEL_PRIMARY,
             fallback_models=SUMMARY_MODEL_FALLBACKS,
             temperature=0.1,
-            max_tokens=MAX_OUTPUT_TOKENS,
+            max_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
         )
 
         if not ai_result["ok"]:
@@ -1453,6 +2201,7 @@ class KnowledgeBot:
             }, False
 
         summary_points = parsed.get("summary_points", [])
+        detailed_summary = str(parsed.get("detailed_summary", "")).strip()
         review_questions = parsed.get("review_questions", [])
 
         if not isinstance(summary_points, list):
@@ -1460,16 +2209,66 @@ class KnowledgeBot:
         if not isinstance(review_questions, list):
             review_questions = []
 
-        summary_points = [str(x).strip() for x in summary_points if str(x).strip()][:5]
+        summary_points = [str(x).strip() for x in summary_points if str(x).strip()][:10]
         review_questions = [str(x).strip() for x in review_questions if str(x).strip()][
             :5
         ]
 
         return {
             "summary_points": summary_points,
+            "detailed_summary": detailed_summary,
             "review_questions": review_questions,
             "model": ai_result["model"],
         }, has_more
+
+    async def expand_summary_analysis(
+        self,
+        channel_name,
+        summary_points,
+        detailed_summary,
+        review_questions,
+    ):
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là trợ lý học tập. Mục tiêu: mở rộng phần tóm tắt hiện có thành"
+                    " phiên bản sâu hơn, có hệ thống, dễ ôn tập."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Channel: #{channel_name}\n"
+                    f"Ý chính hiện có:\n{chr(10).join([f'- {p}' for p in (summary_points or [])])}\n\n"
+                    f"Phân tích hiện có:\n{detailed_summary}\n\n"
+                    f"Câu hỏi ôn tập:\n{chr(10).join([f'- {q}' for q in (review_questions or [])])}\n\n"
+                    "Hãy viết phần phân tích sâu hơn, dài hơn, có cấu trúc rõ ràng"
+                    " (khái niệm, mối liên hệ, ví dụ, checklist ôn tập nhanh)."
+                ),
+            },
+        ]
+
+        ai_result = await self._call_ai_with_fallback(
+            messages=messages,
+            primary_model=SUMMARY_MODEL_PRIMARY,
+            fallback_models=SUMMARY_MODEL_FALLBACKS,
+            temperature=0.2,
+            max_tokens=SUMMARY_MAX_OUTPUT_TOKENS,
+        )
+
+        if not ai_result.get("ok"):
+            return {
+                "ok": False,
+                "error": ai_result.get("error", "Unknown error"),
+                "model": ai_result.get("model"),
+            }
+
+        return {
+            "ok": True,
+            "content": (ai_result.get("content") or "").strip(),
+            "model": ai_result.get("model"),
+        }
 
     async def review_study_answer(self, question, user_answer, summary_points=None):
         summary_context = "\n".join([f"- {p}" for p in (summary_points or [])])
@@ -1572,6 +2371,8 @@ def _create_chat_session(
 
 
 async def _continue_summary_for_user(user_id):
+    _ensure_daily_window_rollover()
+
     if user_id != YOUR_USER_ID:
         return {"ok": False, "message": "⛔ Bạn không có quyền dùng lệnh này."}
 
@@ -1597,6 +2398,17 @@ async def _continue_summary_for_user(user_id):
         question_start_index=next_question_index,
     )
 
+    _persist_questions_for_spaced_repetition(
+        user_id=user_id,
+        channel_name=state["channel_name"],
+        summary_data=summary_data,
+        numbered_questions=numbered_questions,
+    )
+    theory_text = _build_question_theory_text(
+        summary_data.get("summary_points", []),
+        summary_data.get("detailed_summary", ""),
+    )
+
     for item in numbered_questions:
         _study_questions.setdefault(user_id, []).append(
             {
@@ -1604,6 +2416,7 @@ async def _continue_summary_for_user(user_id):
                 "channel_name": state["channel_name"],
                 "question": item["question"],
                 "summary_points": summary_data.get("summary_points", []),
+                "theory": theory_text,
             }
         )
 
@@ -1613,18 +2426,22 @@ async def _continue_summary_for_user(user_id):
         return {
             "ok": True,
             "embed": embed,
+            "summary_data": summary_data,
+            "numbered_questions": numbered_questions,
+            "channel_name": state["channel_name"],
             "has_more": True,
             "remaining": max(0, remaining),
             "channel_id": channel_id,
         }
 
     del summary_state[channel_id]
-    if channel_id in daily_messages:
-        del daily_messages[channel_id]
 
     return {
         "ok": True,
         "embed": embed,
+        "summary_data": summary_data,
+        "numbered_questions": numbered_questions,
+        "channel_name": state["channel_name"],
         "has_more": False,
         "remaining": 0,
         "channel_id": channel_id,
@@ -1692,6 +2509,7 @@ class ChatSessionView(discord.ui.View):
             return
 
         answer = (ai_result.get("content") or "").strip()
+        display_answer = _format_rich_text_for_discord(answer)
         model_used = ai_result.get("model")
         new_session_id = _create_chat_session(
             user_id=interaction.user.id,
@@ -1706,7 +2524,7 @@ class ChatSessionView(discord.ui.View):
 
         embed = discord.Embed(
             title="💬 Chatbot (Continue)",
-            description=answer[:3900],
+            description=display_answer[:3900],
             color=discord.Color.blurple(),
             timestamp=datetime.now(VIETNAM_TZ),
         )
@@ -1716,23 +2534,313 @@ class ChatSessionView(discord.ui.View):
             embed=embed, view=ChatSessionView(new_session_id)
         )
 
-        remaining = answer[3900:]
+        remaining = display_answer[3900:]
         for chunk in _split_text_chunks(remaining, 1900):
             await interaction.followup.send(f"📎 Phần tiếp theo:\n{chunk}")
 
 
-class SummaryContinueView(discord.ui.View):
-    def __init__(self, owner_id):
-        super().__init__(timeout=1800)
-        self.owner_id = owner_id
-
-    @discord.ui.button(label="Continue Summary", style=discord.ButtonStyle.success)
-    async def continue_summary(
-        self, interaction: discord.Interaction, button: discord.ui.Button
+class StudyAnswerModal(discord.ui.Modal):
+    def __init__(
+        self,
+        owner_id,
+        question_index,
+        question_text,
+        theory_text="",
+        summary_points=None,
+        channel_name="",
     ):
+        super().__init__(title=f"Trả lời câu {question_index}")
+        self.owner_id = owner_id
+        self.question_index = question_index
+        self.question_text = question_text
+        self.theory_text = str(theory_text or "").strip()
+        self.summary_points = summary_points or []
+        self.channel_name = channel_name
+
+        theory_preview = (
+            self.theory_text[:3800]
+            if self.theory_text
+            else "Không có lý thuyết đính kèm."
+        )
+
+        self.theory_display = discord.ui.TextInput(
+            label="Lý thuyết ôn nhanh (đọc trước)",
+            style=discord.TextStyle.paragraph,
+            default=theory_preview,
+            required=False,
+            max_length=4000,
+        )
+        self.add_item(self.theory_display)
+
+        self.question_display = discord.ui.TextInput(
+            label="Câu hỏi",
+            style=discord.TextStyle.paragraph,
+            default=str(question_text)[:1000],
+            required=False,
+            max_length=1000,
+        )
+        self.add_item(self.question_display)
+
+        self.user_answer = discord.ui.TextInput(
+            label="Câu trả lời của bạn",
+            style=discord.TextStyle.paragraph,
+            placeholder="Nhập câu trả lời của bạn tại đây...",
+            required=True,
+            max_length=2000,
+        )
+        self.add_item(self.user_answer)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "⛔ Bạn không thể trả lời cho session của người khác.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        review = await knowledge_bot.review_study_answer(
+            self.question_text,
+            str(self.user_answer.value).strip(),
+            self.summary_points,
+        )
+
+        if not review.get("ok"):
+            await interaction.followup.send(
+                review.get("error", "⚠️ Có lỗi khi chấm câu trả lời."),
+                ephemeral=True,
+            )
+            return
+
+        score_value = _normalize_score_value(review.get("score"))
+        passed = score_value is not None and score_value >= STUDY_PASS_THRESHOLD
+        points_delta = int(STUDY_POINTS_PASS) if passed else 0
+
+        updated_stats = _append_study_event(
+            user_id=interaction.user.id,
+            event_type="pass" if passed else "answer",
+            points_delta=points_delta,
+            question_index=self.question_index,
+            score=score_value,
+            note=("Đạt ngưỡng" if passed else "Chưa đạt ngưỡng"),
+        )
+        sm2_result = _record_spaced_review(
+            user_id=interaction.user.id,
+            target_question={
+                "channel_name": self.channel_name,
+                "question": self.question_text,
+                "theory": self.theory_text,
+            },
+            score_value=score_value,
+            answered=True,
+            note=("Đạt ngưỡng" if passed else "Chưa đạt ngưỡng"),
+        )
+        _mark_question_answered(interaction.user.id, self.question_index)
+
+        embed = discord.Embed(
+            title=f"🧪 Nhận xét câu {self.question_index}",
+            color=discord.Color.green(),
+            timestamp=datetime.now(VIETNAM_TZ),
+        )
+        embed.add_field(
+            name="❓ Câu hỏi", value=self.question_text[:1024], inline=False
+        )
+        embed.add_field(
+            name="📝 Câu trả lời của bạn",
+            value=str(self.user_answer.value)[:1024],
+            inline=False,
+        )
+        embed.add_field(
+            name="📊 Điểm", value=str(review.get("score", "?")), inline=True
+        )
+        embed.add_field(
+            name="💬 Nhận xét",
+            value=str(review.get("feedback", ""))[:1024],
+            inline=False,
+        )
+        if review.get("suggestion"):
+            embed.add_field(
+                name="✅ Gợi ý cải thiện",
+                value=str(review.get("suggestion"))[:1024],
+                inline=False,
+            )
+        embed.add_field(
+            name="🔥 Study points",
+            value=(
+                f"{'+%d' % points_delta if points_delta else '+0'} điểm | "
+                f"Tổng: {updated_stats.get('total_points', 0)} | "
+                f"Streak: {updated_stats.get('streak_days', 0)} ngày"
+            )[:1024],
+            inline=False,
+        )
+        if sm2_result:
+            embed.add_field(
+                name="🧠 Spaced Repetition",
+                value=(
+                    f"Quality: {sm2_result.get('quality')} | "
+                    f"Interval: {sm2_result.get('interval_days')} ngày | "
+                    f"Due: {sm2_result.get('due_date')}"
+                )[:1024],
+                inline=False,
+            )
+        embed.set_footer(text=f"Đang trả lời bằng: {review.get('model')}")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class SummaryAnswerButton(discord.ui.Button):
+    def __init__(self, owner_id, question_item):
+        self.owner_id = owner_id
+        self.question_item = question_item
+        index = int(question_item.get("index", 0))
+        row = 0 if index <= 5 else 1
+        super().__init__(
+            label=f"Trả lời câu {index}",
+            style=discord.ButtonStyle.primary,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
                 "⛔ Bạn không thể thao tác trên summary của người khác.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            StudyAnswerModal(
+                owner_id=self.owner_id,
+                question_index=self.question_item["index"],
+                question_text=self.question_item["question"],
+                theory_text=self.question_item.get("theory", ""),
+                summary_points=self.question_item.get("summary_points", []),
+                channel_name=self.question_item.get("channel_name", ""),
+            )
+        )
+
+
+class SummaryInteractiveView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id,
+        channel_name,
+        summary_data,
+        numbered_questions,
+        has_more=False,
+    ):
+        super().__init__(timeout=1800)
+        self.owner_id = owner_id
+        self.channel_name = channel_name
+        self.summary_data = summary_data or {}
+        self.numbered_questions = numbered_questions or []
+        self.has_more = bool(has_more)
+
+        for item in self.numbered_questions[:5]:
+            payload = {
+                "index": item["index"],
+                "question": item["question"],
+                "summary_points": self.summary_data.get("summary_points", []),
+                "theory": _build_question_theory_text(
+                    self.summary_data.get("summary_points", []),
+                    self.summary_data.get("detailed_summary", ""),
+                ),
+                "channel_name": self.channel_name,
+            }
+            self.add_item(SummaryAnswerButton(self.owner_id, payload))
+
+        if not self.has_more:
+            for child in list(self.children):
+                if (
+                    isinstance(child, discord.ui.Button)
+                    and str(child.label or "") == "Continue Summary"
+                ):
+                    self.remove_item(child)
+
+    async def _ensure_owner(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "⛔ Bạn không thể thao tác trên summary của người khác.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Dùng summary làm context", style=discord.ButtonStyle.secondary, row=2
+    )
+    async def use_summary_context(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not await self._ensure_owner(interaction):
+            return
+
+        _pending_chat_context[interaction.user.id] = _build_study_context_text(
+            self.channel_name,
+            self.summary_data,
+            self.numbered_questions,
+        )
+        await interaction.response.send_message(
+            "✅ Đã lưu context từ summary. Tin nhắn `!chat` hoặc `/chat` kế tiếp sẽ dùng context này.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Phân tích sâu hơn", style=discord.ButtonStyle.success, row=2
+    )
+    async def deepen_summary(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not await self._ensure_owner(interaction):
+            return
+
+        await interaction.response.defer(thinking=True)
+        result = await knowledge_bot.expand_summary_analysis(
+            self.channel_name,
+            self.summary_data.get("summary_points", []),
+            self.summary_data.get("detailed_summary", ""),
+            self.summary_data.get("review_questions", []),
+        )
+
+        if not result.get("ok"):
+            await interaction.followup.send(
+                f"⚠️ Không thể phân tích sâu hơn: {result.get('error', 'Unknown error')}",
+                ephemeral=True,
+            )
+            return
+
+        content = (result.get("content") or "").strip()
+        if not content:
+            await interaction.followup.send(
+                "⚠️ Model không trả về nội dung.", ephemeral=True
+            )
+            return
+
+        display_content = _format_rich_text_for_discord(content)
+
+        embed = discord.Embed(
+            title=f"🔍 Phân tích sâu hơn #{self.channel_name}",
+            description=display_content[:3900],
+            color=discord.Color.green(),
+            timestamp=datetime.now(VIETNAM_TZ),
+        )
+        embed.set_footer(text=f"Model: {result.get('model')}")
+        await interaction.followup.send(embed=embed)
+
+        for chunk in _split_text_chunks(display_content[3900:], 1900):
+            await interaction.followup.send(f"📎 Phần tiếp theo:\n{chunk}")
+
+    @discord.ui.button(
+        label="Continue Summary", style=discord.ButtonStyle.primary, row=2
+    )
+    async def continue_summary(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not await self._ensure_owner(interaction):
+            return
+
+        if not self.has_more:
+            await interaction.response.send_message(
+                "✅ Summary đã hết phần còn lại cho phiên hiện tại.",
                 ephemeral=True,
             )
             return
@@ -1748,9 +2856,21 @@ class SummaryContinueView(discord.ui.View):
 
         if result.get("embed"):
             next_view = (
-                SummaryContinueView(interaction.user.id)
+                SummaryInteractiveView(
+                    interaction.user.id,
+                    result.get("channel_name", "unknown"),
+                    result.get("summary_data", {}),
+                    result.get("numbered_questions", []),
+                    has_more=result.get("has_more"),
+                )
                 if result.get("has_more")
-                else None
+                else SummaryInteractiveView(
+                    interaction.user.id,
+                    result.get("channel_name", "unknown"),
+                    result.get("summary_data", {}),
+                    result.get("numbered_questions", []),
+                    has_more=False,
+                )
             )
             await interaction.followup.send(embed=result["embed"], view=next_view)
 
@@ -1768,6 +2888,7 @@ class SummaryContinueView(discord.ui.View):
 @bot.event
 async def on_ready():
     print(f"✅ Bot: {bot.user}")
+    _ensure_daily_window_rollover()
 
     try:
         if APP_GUILD_ID:
@@ -1785,6 +2906,8 @@ async def on_ready():
     evening_summary.start()
     end_of_day_review.start()
     countdown_checker.start()
+    daily_rollover.start()
+    idle_motivation.start()
 
     # Auto-activate New Year countdown if today is Dec 31
     now = datetime.now(knowledge_bot.timezone)
@@ -1823,6 +2946,11 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    _ensure_daily_window_rollover()
+
+    if message.author.id == YOUR_USER_ID:
+        _mark_user_interaction(message.author.id)
+
     if message.channel.id in CHANNELS_TO_MONITOR:
         channel_id = message.channel.id
         if channel_id not in daily_messages:
@@ -1833,12 +2961,71 @@ async def on_message(message):
             f"[{timestamp}] {message.author.name}: {message.content}{attachment_context}"
         )
 
-    await bot.process_commands(message)
+    # Slash-first: không xử lý prefix command (ví dụ !...)
+    return
+
+
+@bot.event
+async def on_command_completion(ctx):
+    _mark_user_interaction(ctx.author.id)
+
+
+@bot.event
+async def on_app_command_completion(interaction: discord.Interaction, command):
+    _mark_user_interaction(interaction.user.id)
 
 
 # ==============================
 # TASKS
 # ==============================
+@tasks.loop(time=time(hour=0, minute=0, tzinfo=VIETNAM_TZ))
+async def daily_rollover():
+    _ensure_daily_window_rollover()
+
+
+@daily_rollover.before_loop
+async def before_daily_rollover():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=SLOGAN_CHECK_INTERVAL_MINUTES)
+async def idle_motivation():
+    if MAIN_CHANNEL_ID == 0 or YOUR_USER_ID == 0:
+        return
+
+    channel = bot.get_channel(MAIN_CHANNEL_ID)
+    if not channel:
+        return
+
+    now = datetime.now(VIETNAM_TZ)
+    last_interaction = _last_interaction_at.get(YOUR_USER_ID)
+    if last_interaction is None:
+        return
+
+    idle_minutes = (now - last_interaction).total_seconds() / 60
+    if idle_minutes < SLOGAN_IDLE_MINUTES:
+        return
+
+    last_sent = _last_slogan_sent_at.get(YOUR_USER_ID)
+    if last_sent:
+        sent_gap = (now - last_sent).total_seconds() / 60
+        if sent_gap < SLOGAN_IDLE_MINUTES:
+            return
+
+    slogan = await _fetch_motivational_slogan()
+    await channel.send(
+        f"💡 **Nhắc nhẹ học tập**\n"
+        f"Bạn đã im lặng khoảng **{int(idle_minutes)} phút**.\n"
+        f"*{slogan}*"
+    )
+    _last_slogan_sent_at[YOUR_USER_ID] = now
+
+
+@idle_motivation.before_loop
+async def before_idle_motivation():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(time=time(hour=6, minute=30, tzinfo=VIETNAM_TZ))
 async def morning_greeting():
     if MAIN_CHANNEL_ID == 0:
@@ -1858,6 +3045,8 @@ async def morning_greeting():
         message += f"🎉 **{holiday}**\n\n"
 
     message += f"{weather}\n"
+    if YOUR_USER_ID:
+        message += "\n" + _build_study_status_text(YOUR_USER_ID) + "\n"
 
     # Events
     events = calendar_data["events"]
@@ -2000,6 +3189,9 @@ async def end_of_day_review():
             message += f"• {task['title']} (hạn: {due_str})\n"
         message += "\n⚡ Ưu tiên xử lý ngay!\n"
 
+    if YOUR_USER_ID:
+        message += "\n" + _build_study_status_text(YOUR_USER_ID)
+
     await channel.send(message)
 
 
@@ -2010,6 +3202,8 @@ async def before_end_of_day_review():
 
 @tasks.loop(time=time(hour=21, minute=0, tzinfo=VIETNAM_TZ))
 async def evening_summary():
+    _ensure_daily_window_rollover()
+
     if MAIN_CHANNEL_ID == 0:
         return
 
@@ -2026,7 +3220,7 @@ async def evening_summary():
         channel_name = discord_channel.name if discord_channel else str(channel_id)
 
         summary_data, has_more = await knowledge_bot.summarize_daily_knowledge(
-            messages, channel_name, 0, 50
+            messages, channel_name, 0, SUMMARY_BATCH_SIZE
         )
 
         if summary_data:
@@ -2042,12 +3236,14 @@ async def evening_summary():
                 summary_state[channel_id] = {
                     "messages": messages,
                     "channel_name": channel_name,
-                    "offset": 50,
+                    "offset": SUMMARY_BATCH_SIZE,
                 }
-                await channel.send(f"💡 Còn {len(messages) - 50} tin nhắn. `!continue`")
+                await channel.send(
+                    f"💡 Còn {len(messages) - SUMMARY_BATCH_SIZE} tin nhắn. Dùng `/continue_summary`"
+                )
 
     if not summary_state:
-        daily_messages.clear()
+        await channel.send("🧠 Dữ liệu học tập hôm nay vẫn được giữ đến hết ngày.")
 
 
 @evening_summary.before_loop
@@ -2152,6 +3348,7 @@ async def show_help(ctx, category=""):
                 "`!tasks` - Xem tasks\n"
                 "`!countdown` - Xem countdowns\n"
                 "`!weather` - Thời tiết\n"
+                "`!slogan` - Câu động lực học\n"
                 "`!summary` - Tổng hợp học tập\n"
                 "`!chat` - Chat trực tiếp với AI"
             ),
@@ -2342,8 +3539,10 @@ async def show_help(ctx, category=""):
             name="📝 Tổng Hợp",
             value=(
                 "`!summary` - Tổng hợp tin nhắn hôm nay\n"
-                "`!continue` - Tiếp tục phần còn lại\n"
+                "`/summary channel:<kênh> latest_messages:<N>` - Tổng hợp N tin gần nhất của 1 kênh\n"
+                "`/continue_summary` - Tiếp tục phần còn lại\n"
                 "`!stats` - Thống kê theo channel\n"
+                "`!study_stats` - Xem streak/điểm học tập tháng\n"
                 "`!answer <số> | <trả lời>` - Trả lời câu hỏi ôn tập"
             ),
             inline=False,
@@ -2818,6 +4017,15 @@ async def weather(ctx):
     await ctx.send(result)
 
 
+@bot.command(name="slogan")
+async def slogan(ctx):
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    _mark_user_interaction(ctx.author.id)
+    text = await _fetch_motivational_slogan()
+    await ctx.send(f"💪 **Slogan học tập:**\n*{text}*")
+
+
 @bot.command()
 async def chat(ctx, *, prompt=""):
     """Chat trực tiếp với AI"""
@@ -2841,6 +4049,7 @@ async def chat(ctx, *, prompt=""):
         return
 
     answer = ai_result["content"].strip()
+    display_answer = _format_rich_text_for_discord(answer)
     model_used = ai_result["model"]
     vision_models = ai_result.get("vision_models", [])
     image_extractions = ai_result.get("image_extractions", [])
@@ -2858,7 +4067,7 @@ async def chat(ctx, *, prompt=""):
 
     embed = discord.Embed(
         title="💬 Chatbot",
-        description=answer[:3900],
+        description=display_answer[:3900],
         color=discord.Color.blurple(),
         timestamp=datetime.now(VIETNAM_TZ),
     )
@@ -2907,7 +4116,7 @@ async def chat(ctx, *, prompt=""):
             image_embed.set_image(url=image_url)
             await ctx.send(embed=image_embed)
 
-    remaining = answer[3900:]
+    remaining = display_answer[3900:]
     for chunk in _split_text_chunks(remaining, 1900):
         await ctx.send(f"📎 Phần tiếp theo:\n{chunk}")
 
@@ -2934,9 +4143,12 @@ async def reason(ctx, *, prompt=""):
     answer = (ai_result.get("content") or "").strip()
     if not answer:
         answer = "⚠️ Không có nội dung hiển thị được."
+    display_answer = _format_rich_text_for_discord(answer)
 
     model_used = ai_result["model"]
-    combined_message = _build_reason_single_message(prompt_clean, answer, model_used)
+    combined_message = _build_reason_single_message(
+        prompt_clean, display_answer, model_used
+    )
 
     if len(combined_message) <= 2000:
         await ctx.send(combined_message)
@@ -2956,9 +4168,19 @@ async def summary(ctx):
     if ctx.author.id != YOUR_USER_ID:
         return
 
+    _ensure_daily_window_rollover()
+    _mark_user_interaction(ctx.author.id)
+
     if not daily_messages:
         await ctx.send("📚 Không có tin nhắn")
         return
+
+    penalty = _apply_unanswered_penalty(ctx.author.id)
+    if penalty.get("applied"):
+        await ctx.send(
+            f"⚠️ Bạn còn {penalty.get('count', 0)} câu hỏi chưa trả lời từ phiên trước."
+            f" Trừ {abs(int(penalty.get('points_delta', 0)))} điểm."
+        )
 
     _study_questions[ctx.author.id] = []
     question_index = 1
@@ -2981,7 +4203,33 @@ async def summary(ctx):
                     summary_data,
                     question_start_index=question_index,
                 )
-                await ctx.send(embed=embed)
+                view = SummaryInteractiveView(
+                    ctx.author.id,
+                    channel_name,
+                    summary_data,
+                    numbered_questions,
+                    has_more=has_more,
+                )
+                await ctx.send(embed=embed, view=view)
+
+                _persist_questions_for_spaced_repetition(
+                    user_id=ctx.author.id,
+                    channel_name=channel_name,
+                    summary_data=summary_data,
+                    numbered_questions=numbered_questions,
+                )
+                theory_text = _build_question_theory_text(
+                    summary_data.get("summary_points", []),
+                    summary_data.get("detailed_summary", ""),
+                )
+
+                _append_study_event(
+                    user_id=ctx.author.id,
+                    event_type="summary",
+                    points_delta=0,
+                    channel_name=channel_name,
+                    note=f"Tạo summary với {len(messages)} tin nhắn",
+                )
 
                 for item in numbered_questions:
                     _study_questions[ctx.author.id].append(
@@ -2990,6 +4238,7 @@ async def summary(ctx):
                             "channel_name": channel_name,
                             "question": item["question"],
                             "summary_points": summary_data.get("summary_points", []),
+                            "theory": theory_text,
                         }
                     )
                 question_index += len(numbered_questions)
@@ -3001,29 +4250,8 @@ async def summary(ctx):
                     "offset": 50,
                 }
                 await ctx.send(
-                    f"💡 Còn {len(messages) - 50} tin nhắn chưa summary.",
-                    view=SummaryContinueView(ctx.author.id),
+                    f"💡 Còn {len(messages) - 50} tin nhắn chưa summary. Bấm `Continue Summary` ngay dưới embed vừa gửi hoặc dùng `/continue_summary`.",
                 )
-
-
-@bot.command(name="continue")
-async def continue_summary(ctx):
-    result = await _continue_summary_for_user(ctx.author.id)
-    if not result.get("ok"):
-        await ctx.send(result.get("message", "⚠️ Có lỗi khi continue summary"))
-        return
-
-    await ctx.send(
-        embed=result.get("embed"),
-        view=SummaryContinueView(ctx.author.id) if result.get("has_more") else None,
-    )
-
-    if result.get("has_more"):
-        await ctx.send(
-            f"💡 Còn {result.get('remaining', 0)} tin nhắn chưa summary. Bấm `Continue Summary` hoặc dùng `!continue`."
-        )
-    else:
-        await ctx.send("✅ Đã summary xong toàn bộ phần còn lại.")
 
 
 @bot.command()
@@ -3062,6 +4290,27 @@ async def answer(ctx, *, args=""):
         await ctx.send(review["error"])
         return
 
+    score_value = _normalize_score_value(review.get("score"))
+    passed = score_value is not None and score_value >= STUDY_PASS_THRESHOLD
+    points_delta = int(STUDY_POINTS_PASS) if passed else 0
+    stats = _append_study_event(
+        user_id=ctx.author.id,
+        event_type="pass" if passed else "answer",
+        points_delta=points_delta,
+        question_index=question_index,
+        channel_name=target_question.get("channel_name", ""),
+        score=score_value,
+        note=("Đạt ngưỡng" if passed else "Chưa đạt ngưỡng"),
+    )
+    sm2_result = _record_spaced_review(
+        user_id=ctx.author.id,
+        target_question=target_question,
+        score_value=score_value,
+        answered=True,
+        note=("Đạt ngưỡng" if passed else "Chưa đạt ngưỡng"),
+    )
+    _mark_question_answered(ctx.author.id, question_index)
+
     embed = discord.Embed(
         title=f"🧪 Nhận xét câu {question_index}",
         color=discord.Color.green(),
@@ -3081,6 +4330,25 @@ async def answer(ctx, *, args=""):
         embed.add_field(
             name="✅ Gợi ý cải thiện",
             value=str(review["suggestion"])[:1024],
+            inline=False,
+        )
+    embed.add_field(
+        name="🔥 Study points",
+        value=(
+            f"{'+%d' % points_delta if points_delta else '+0'} điểm | "
+            f"Tổng: {stats.get('total_points', 0)} | "
+            f"Streak: {stats.get('streak_days', 0)} ngày"
+        )[:1024],
+        inline=False,
+    )
+    if sm2_result:
+        embed.add_field(
+            name="🧠 Spaced Repetition",
+            value=(
+                f"Quality: {sm2_result.get('quality')} | "
+                f"Interval: {sm2_result.get('interval_days')} ngày | "
+                f"Due: {sm2_result.get('due_date')}"
+            )[:1024],
             inline=False,
         )
     embed.set_footer(text=f"Đang trả lời bằng: {review['model']}")
@@ -3106,6 +4374,15 @@ async def stats(ctx):
 
     message += f"\n**Tổng:** {total}"
     await ctx.send(message)
+
+
+@bot.command(name="study_stats")
+async def study_stats(ctx):
+    if ctx.author.id != YOUR_USER_ID:
+        return
+    await ctx.send(
+        embed=_build_study_metrics_embed(ctx.author.id, ctx.author.display_name)
+    )
 
 
 @bot.command()
@@ -3152,13 +4429,14 @@ async def slash_help(
         )
         embed.add_field(
             name="📚 Study",
-            value="`/summary`, `/continue_summary`, `/answer`",
+            value="`/summary`, `/continue_summary`, `/answer`, `/study_stats`",
             inline=False,
         )
         embed.add_field(name="💬 Chat", value="`/chat`, `/reason`", inline=False)
         embed.add_field(
             name="🛠️ Utility", value="`/weather`, `/ping`, `/stats`", inline=False
         )
+        embed.add_field(name="💪 Motivation", value="`/slogan`", inline=False)
     elif category == "calendar":
         embed.description = "Lệnh calendar"
         embed.add_field(name="`/calendar`", value="Xem lịch tổng", inline=False)
@@ -3184,12 +4462,24 @@ async def slash_help(
         embed.add_field(name="`/tet`", value="Bật countdown tết", inline=False)
     elif category == "study":
         embed.description = "Lệnh học tập"
-        embed.add_field(name="`/summary`", value="Tổng hợp + tạo câu hỏi", inline=False)
+        embed.add_field(
+            name="`/summary`",
+            value=(
+                "Tổng hợp + tạo câu hỏi\n"
+                "• mode `cache`: dùng dữ liệu lưu trong ngày\n"
+                "• mode `channel`: fetch 1 kênh + `latest_messages` (tối đa 20), chọn kênh qua autocomplete\n"
+                "• mode `all`: quét kênh theo dõi, chỉ summary kênh có tin mới"
+            ),
+            inline=False,
+        )
         embed.add_field(
             name="`/continue_summary`", value="Tiếp tục phần còn lại", inline=False
         )
         embed.add_field(
             name="`/answer`", value="Trả lời câu hỏi và nhận xét", inline=False
+        )
+        embed.add_field(
+            name="`/study_stats`", value="Xem streak/điểm học tập tháng", inline=False
         )
     elif category == "chat":
         embed.description = "Lệnh chatbot"
@@ -3205,10 +4495,17 @@ async def slash_help(
         )
     elif category == "utility":
         embed.description = "Lệnh tiện ích"
-        embed.add_field(name="`/weather`", value="Xem thời tiết hiện tại", inline=False)
+        embed.add_field(
+            name="`/weather`",
+            value="Xem thời tiết hiện tại hoặc forecast theo ngày/giờ",
+            inline=False,
+        )
         embed.add_field(name="`/ping`", value="Kiểm tra độ trễ bot", inline=False)
         embed.add_field(
             name="`/stats`", value="Thống kê tin nhắn theo dõi", inline=False
+        )
+        embed.add_field(
+            name="`/slogan`", value="In slogan tạo động lực học", inline=False
         )
     else:
         embed.description = (
@@ -3226,11 +4523,52 @@ async def slash_ping(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="weather", description="Xem thời tiết hiện tại")
-async def slash_weather(interaction: discord.Interaction):
+@bot.tree.command(
+    name="weather", description="Xem thời tiết hiện tại hoặc forecast theo ngày/giờ"
+)
+@app_commands.describe(
+    date="Ngày cần xem: today, tomorrow, 18/2...",
+    hour="Giờ cần xem: 14:00, 9h, 18h30...",
+)
+async def slash_weather(
+    interaction: discord.Interaction,
+    date: str = "",
+    hour: str = "",
+):
+    target_date = knowledge_bot.parse_date(date) if date else None
+    target_time = knowledge_bot.parse_time(hour) if hour else None
+
+    if date and not target_date:
+        await interaction.response.send_message(
+            "⚠️ Ngày không hợp lệ. VD: `today`, `tomorrow`, `18/2`.",
+            ephemeral=True,
+        )
+        return
+
+    if hour and not target_time:
+        await interaction.response.send_message(
+            "⚠️ Giờ không hợp lệ. VD: `14:00`, `9h`, `18h30`.",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.defer(thinking=True)
-    result = await knowledge_bot.get_weather()
+    result = await knowledge_bot.get_weather(
+        target_date=target_date, target_time=target_time
+    )
     await interaction.followup.send(result)
+
+
+@bot.tree.command(name="slogan", description="Nhận 1 slogan tạo động lực học tập")
+async def slash_slogan(interaction: discord.Interaction):
+    if interaction.user.id != YOUR_USER_ID:
+        await interaction.response.send_message(
+            "⛔ Bạn không có quyền dùng lệnh này.", ephemeral=True
+        )
+        return
+    _mark_user_interaction(interaction.user.id)
+    text = await _fetch_motivational_slogan()
+    await interaction.response.send_message(f"💪 **Slogan học tập:**\n*{text}*")
 
 
 @bot.tree.command(name="chat", description="Chat trực tiếp với AI")
@@ -3273,6 +4611,7 @@ async def slash_chat(
         return
 
     answer = ai_result["content"].strip()
+    display_answer = _format_rich_text_for_discord(answer)
     model_used = ai_result["model"]
     vision_models = ai_result.get("vision_models", [])
     image_extractions = ai_result.get("image_extractions", [])
@@ -3290,7 +4629,7 @@ async def slash_chat(
 
     embed = discord.Embed(
         title="💬 Chatbot",
-        description=answer[:3900],
+        description=display_answer[:3900],
         color=discord.Color.blurple(),
         timestamp=datetime.now(VIETNAM_TZ),
     )
@@ -3339,7 +4678,7 @@ async def slash_chat(
             image_embed.set_image(url=image_url)
             await interaction.followup.send(embed=image_embed)
 
-    remaining = answer[3900:]
+    remaining = display_answer[3900:]
     for chunk in _split_text_chunks(remaining, 1900):
         await interaction.followup.send(f"📎 Phần tiếp theo:\n{chunk}")
 
@@ -3365,9 +4704,10 @@ async def slash_reason(
     answer = (ai_result.get("content") or "").strip()
     if not answer:
         answer = "⚠️ Không có nội dung hiển thị được."
+    display_answer = _format_rich_text_for_discord(answer)
 
     model_used = ai_result["model"]
-    combined_message = _build_reason_single_message(prompt, answer, model_used)
+    combined_message = _build_reason_single_message(prompt, display_answer, model_used)
 
     if len(combined_message) <= 2000:
         await _safe_followup_send(interaction, combined_message)
@@ -3379,27 +4719,184 @@ async def slash_reason(
 
 
 @bot.tree.command(name="summary", description="Tổng hợp học tập và tạo câu hỏi ôn tập")
-async def slash_summary(interaction: discord.Interaction):
+@app_commands.describe(
+    mode="cache: dữ liệu lưu trong ngày | channel: fetch 1 kênh | all: quét các kênh có tin mới",
+    channel_option="Chọn channel từ danh sách gợi ý (hoặc all)",
+    latest_messages="Số tin gần nhất khi fetch (tối đa 20). Bỏ trống ở mode=all để chỉ lấy tin mới trong hôm nay",
+)
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="cache", value="cache"),
+        app_commands.Choice(name="channel", value="channel"),
+        app_commands.Choice(name="all", value="all"),
+    ]
+)
+async def slash_summary(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str] = None,
+    channel_option: str = "",
+    latest_messages: int = None,
+):
     if interaction.user.id != YOUR_USER_ID:
         await interaction.response.send_message(
             "⛔ Bạn không có quyền dùng lệnh này.", ephemeral=True
         )
         return
 
-    if not daily_messages:
-        await interaction.response.send_message("📚 Không có tin nhắn", ephemeral=True)
+    _ensure_daily_window_rollover()
+    _mark_user_interaction(interaction.user.id)
+
+    if latest_messages is not None and not (
+        1 <= int(latest_messages) <= SUMMARY_FETCH_MAX_MESSAGES
+    ):
+        await interaction.response.send_message(
+            f"⚠️ `latest_messages` chỉ nhận giá trị từ 1 đến {SUMMARY_FETCH_MAX_MESSAGES}.",
+            ephemeral=True,
+        )
+        return
+
+    fetch_limit = (
+        int(latest_messages)
+        if latest_messages is not None
+        else SUMMARY_FETCH_MAX_MESSAGES
+    )
+
+    source_batches = []
+    fetch_checkpoints = {}
+    selected_mode = (mode.value if mode else "cache").lower().strip()
+    selected_channel_option = (channel_option or "").strip().lower()
+
+    def _resolve_channel_by_option(option_text):
+        if not option_text:
+            return None
+        if option_text == "all":
+            return "all"
+        if option_text.isdigit():
+            return bot.get_channel(int(option_text))
+
+        for channel_id in CHANNELS_TO_MONITOR:
+            channel_obj = bot.get_channel(channel_id)
+            if channel_obj and channel_obj.name.lower() == option_text.lower():
+                return channel_obj
+            if (
+                f"#{channel_obj.name}".lower() == option_text.lower()
+                if channel_obj
+                else False
+            ):
+                return channel_obj
+        return None
+
+    if selected_mode == "cache":
+        if not daily_messages:
+            await interaction.response.send_message(
+                "📚 Không có tin nhắn", ephemeral=True
+            )
+            return
+        for channel_id, messages in daily_messages.items():
+            discord_channel = bot.get_channel(channel_id)
+            channel_name = discord_channel.name if discord_channel else str(channel_id)
+            source_batches.append((channel_id, channel_name, messages))
+    elif selected_mode == "channel":
+        if not selected_channel_option:
+            await interaction.response.send_message(
+                "⚠️ Chọn `channel_option` khi dùng mode `channel`.", ephemeral=True
+            )
+            return
+
+        resolved = _resolve_channel_by_option(selected_channel_option)
+        if resolved == "all":
+            await interaction.response.send_message(
+                "⚠️ mode `channel` không dùng `all`. Hãy chọn 1 channel cụ thể.",
+                ephemeral=True,
+            )
+            return
+
+        channel = resolved
+        if channel is None:
+            await interaction.response.send_message(
+                "⚠️ Không tìm thấy channel theo lựa chọn.", ephemeral=True
+            )
+            return
+
+        fetched_messages, newest_id = await _collect_new_messages_since(
+            channel,
+            after_message_id=None,
+            latest_messages=fetch_limit,
+        )
+        if not fetched_messages:
+            await interaction.response.send_message(
+                f"📚 Không có tin nhắn phù hợp trong #{channel.name}.",
+                ephemeral=True,
+            )
+            return
+        source_batches.append((channel.id, channel.name, fetched_messages))
+        if newest_id:
+            fetch_checkpoints[channel.id] = newest_id
+    elif selected_mode == "all":
+        if selected_channel_option and selected_channel_option != "all":
+            await interaction.response.send_message(
+                "⚠️ mode `all` chỉ nhận `channel_option=all` hoặc để trống.",
+                ephemeral=True,
+            )
+            return
+
+        for channel_id in CHANNELS_TO_MONITOR:
+            discord_channel = bot.get_channel(channel_id)
+            if discord_channel is None:
+                continue
+
+            if latest_messages is None:
+                last_checkpoint = _last_summary_fetch_message_ids.get(channel_id)
+                fetched_messages, newest_id = await _collect_new_messages_since(
+                    discord_channel,
+                    after_message_id=last_checkpoint,
+                    latest_messages=SUMMARY_FETCH_MAX_MESSAGES,
+                    only_today=True,
+                )
+            else:
+                fetched_messages, newest_id = await _collect_new_messages_since(
+                    discord_channel,
+                    after_message_id=None,
+                    latest_messages=fetch_limit,
+                    only_today=False,
+                )
+
+            if not fetched_messages:
+                continue
+
+            source_batches.append((channel_id, discord_channel.name, fetched_messages))
+            if newest_id:
+                fetch_checkpoints[channel_id] = newest_id
+
+        if not source_batches:
+            await interaction.response.send_message(
+                "📚 Không có channel nào có tin nhắn mới để summary.",
+                ephemeral=True,
+            )
+            return
+    else:
+        await interaction.response.send_message(
+            "⚠️ mode không hợp lệ. Dùng: cache, channel, all.",
+            ephemeral=True,
+        )
         return
 
     await interaction.response.defer(thinking=True)
+
+    penalty = _apply_unanswered_penalty(interaction.user.id)
+    if penalty.get("applied"):
+        await interaction.followup.send(
+            f"⚠️ Bạn còn {penalty.get('count', 0)} câu hỏi chưa trả lời từ phiên trước."
+            f" Trừ {abs(int(penalty.get('points_delta', 0)))} điểm."
+        )
+
     _study_questions[interaction.user.id] = []
     question_index = 1
 
-    for channel_id, messages in daily_messages.items():
-        discord_channel = bot.get_channel(channel_id)
-        channel_name = discord_channel.name if discord_channel else str(channel_id)
+    for channel_id, channel_name, messages in source_batches:
 
         summary_data, has_more = await knowledge_bot.summarize_daily_knowledge(
-            messages, channel_name, 0, 50
+            messages, channel_name, 0, SUMMARY_BATCH_SIZE
         )
 
         if summary_data.get("error"):
@@ -3412,7 +4909,33 @@ async def slash_summary(interaction: discord.Interaction):
             summary_data,
             question_start_index=question_index,
         )
-        await interaction.followup.send(embed=embed)
+        view = SummaryInteractiveView(
+            interaction.user.id,
+            channel_name,
+            summary_data,
+            numbered_questions,
+            has_more=has_more,
+        )
+        await interaction.followup.send(embed=embed, view=view)
+
+        _persist_questions_for_spaced_repetition(
+            user_id=interaction.user.id,
+            channel_name=channel_name,
+            summary_data=summary_data,
+            numbered_questions=numbered_questions,
+        )
+        theory_text = _build_question_theory_text(
+            summary_data.get("summary_points", []),
+            summary_data.get("detailed_summary", ""),
+        )
+
+        _append_study_event(
+            user_id=interaction.user.id,
+            event_type="summary",
+            points_delta=0,
+            channel_name=channel_name,
+            note=f"Tạo summary với {len(messages)} tin nhắn",
+        )
 
         for item in numbered_questions:
             _study_questions[interaction.user.id].append(
@@ -3421,6 +4944,7 @@ async def slash_summary(interaction: discord.Interaction):
                     "channel_name": channel_name,
                     "question": item["question"],
                     "summary_points": summary_data.get("summary_points", []),
+                    "theory": theory_text,
                 }
             )
         question_index += len(numbered_questions)
@@ -3429,16 +4953,27 @@ async def slash_summary(interaction: discord.Interaction):
             summary_state[channel_id] = {
                 "messages": messages,
                 "channel_name": channel_name,
-                "offset": 50,
+                "offset": SUMMARY_BATCH_SIZE,
             }
             await interaction.followup.send(
-                f"💡 Còn {len(messages) - 50} tin nhắn chưa summary.",
-                view=SummaryContinueView(interaction.user.id),
+                f"💡 Còn {len(messages) - SUMMARY_BATCH_SIZE} tin nhắn chưa summary trong #{channel_name}. Bấm `Continue Summary` ngay dưới embed vừa gửi hoặc dùng `/continue_summary`.",
             )
+
+    for channel_id, newest_id in fetch_checkpoints.items():
+        _last_summary_fetch_message_ids[channel_id] = int(newest_id)
+
+
+@slash_summary.autocomplete("channel_option")
+async def slash_summary_channel_option_autocomplete(
+    interaction: discord.Interaction, current: str
+):
+    return await summary_channel_autocomplete(interaction, current)
 
 
 @bot.tree.command(name="continue_summary", description="Tiếp tục summary phần còn lại")
 async def slash_continue_summary(interaction: discord.Interaction):
+    _ensure_daily_window_rollover()
+    _mark_user_interaction(interaction.user.id)
     await interaction.response.defer(thinking=True)
     result = await _continue_summary_for_user(interaction.user.id)
     if not result.get("ok"):
@@ -3449,8 +4984,12 @@ async def slash_continue_summary(interaction: discord.Interaction):
 
     await interaction.followup.send(
         embed=result.get("embed"),
-        view=(
-            SummaryContinueView(interaction.user.id) if result.get("has_more") else None
+        view=SummaryInteractiveView(
+            interaction.user.id,
+            result.get("channel_name", "unknown"),
+            result.get("summary_data", {}),
+            result.get("numbered_questions", []),
+            has_more=result.get("has_more"),
         ),
     )
 
@@ -3500,6 +5039,27 @@ async def slash_answer(
         await interaction.followup.send(review["error"])
         return
 
+    score_value = _normalize_score_value(review.get("score"))
+    passed = score_value is not None and score_value >= STUDY_PASS_THRESHOLD
+    points_delta = int(STUDY_POINTS_PASS) if passed else 0
+    stats = _append_study_event(
+        user_id=interaction.user.id,
+        event_type="pass" if passed else "answer",
+        points_delta=points_delta,
+        question_index=question_number,
+        channel_name=target_question.get("channel_name", ""),
+        score=score_value,
+        note=("Đạt ngưỡng" if passed else "Chưa đạt ngưỡng"),
+    )
+    sm2_result = _record_spaced_review(
+        user_id=interaction.user.id,
+        target_question=target_question,
+        score_value=score_value,
+        answered=True,
+        note=("Đạt ngưỡng" if passed else "Chưa đạt ngưỡng"),
+    )
+    _mark_question_answered(interaction.user.id, question_number)
+
     embed = discord.Embed(
         title=f"🧪 Nhận xét câu {question_number}",
         color=discord.Color.green(),
@@ -3521,8 +5081,154 @@ async def slash_answer(
             value=str(review["suggestion"])[:1024],
             inline=False,
         )
+    embed.add_field(
+        name="🔥 Study points",
+        value=(
+            f"{'+%d' % points_delta if points_delta else '+0'} điểm | "
+            f"Tổng: {stats.get('total_points', 0)} | "
+            f"Streak: {stats.get('streak_days', 0)} ngày"
+        )[:1024],
+        inline=False,
+    )
+    if sm2_result:
+        embed.add_field(
+            name="🧠 Spaced Repetition",
+            value=(
+                f"Quality: {sm2_result.get('quality')} | "
+                f"Interval: {sm2_result.get('interval_days')} ngày | "
+                f"Due: {sm2_result.get('due_date')}"
+            )[:1024],
+            inline=False,
+        )
     embed.set_footer(text=f"Đang trả lời bằng: {review['model']}")
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(
+    name="study_stats", description="Xem streak và điểm học tập tháng hiện tại"
+)
+async def slash_study_stats(interaction: discord.Interaction):
+    if interaction.user.id != YOUR_USER_ID:
+        await interaction.response.send_message(
+            "⛔ Bạn không có quyền dùng lệnh này.", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        embed=_build_study_metrics_embed(
+            interaction.user.id, interaction.user.display_name
+        ),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="knowledge_history",
+    description="Xem các thẻ kiến thức đã học trong N ngày gần đây",
+)
+@app_commands.describe(days="Số ngày cần xem (mặc định 7)")
+async def slash_knowledge_history(interaction: discord.Interaction, days: int = 7):
+    if interaction.user.id != YOUR_USER_ID:
+        await interaction.response.send_message(
+            "⛔ Bạn không có quyền dùng lệnh này.", ephemeral=True
+        )
+        return
+
+    days = max(1, min(int(days or 7), 60))
+    db_path = _ensure_study_memory_tables()
+    rows = study_memory.get_knowledge_by_days(
+        db_path=db_path,
+        user_id=interaction.user.id,
+        days=days,
+    )
+
+    if not rows:
+        await interaction.response.send_message(
+            f"📚 Chưa có dữ liệu học tập trong {days} ngày gần đây.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"📘 Knowledge History ({days} ngày)",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(VIETNAM_TZ),
+    )
+    preview_lines = []
+    for item in rows[:10]:
+        channel_name = (item.get("channel_name") or "unknown").strip()
+        question = str(item.get("question") or "").strip()[:90]
+        score = item.get("last_score")
+        score_text = "N/A" if score is None else str(score)
+        due = item.get("due_date") or "N/A"
+        weak = "⚠️" if int(item.get("weak_flag") or 0) == 1 else "✅"
+        preview_lines.append(
+            f"{weak} #{channel_name}: {question} (score: {score_text}, due: {due})"
+        )
+
+    embed.description = "\n".join(preview_lines)[:4000]
+    embed.set_footer(text=f"Hiển thị {min(len(rows), 10)}/{len(rows)} thẻ gần nhất")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(
+    name="adaptive_path",
+    description="Gợi ý lộ trình ôn tập tuần dựa trên các điểm yếu",
+)
+@app_commands.describe(days="Số ngày dùng để phân tích dữ liệu (mặc định 7)")
+async def slash_adaptive_path(interaction: discord.Interaction, days: int = 7):
+    if interaction.user.id != YOUR_USER_ID:
+        await interaction.response.send_message(
+            "⛔ Bạn không có quyền dùng lệnh này.", ephemeral=True
+        )
+        return
+
+    days = max(1, min(int(days or 7), 60))
+    db_path = _ensure_study_memory_tables()
+    plan = study_memory.build_adaptive_path(
+        db_path=db_path,
+        user_id=interaction.user.id,
+        days=days,
+    )
+
+    embed = discord.Embed(
+        title=f"🧠 Adaptive Learning Path ({days} ngày)",
+        color=discord.Color.purple(),
+        timestamp=datetime.now(VIETNAM_TZ),
+    )
+
+    focus_topics = plan.get("focus_topics", [])
+    if focus_topics:
+        topic_lines = []
+        for topic in focus_topics[:5]:
+            topic_lines.append(
+                f"• {topic.get('topic', 'general')} | TB: {topic.get('avg_score', 'N/A')} | yếu: {topic.get('weak_count', 0)}"
+            )
+        embed.add_field(
+            name="🎯 Chủ đề ưu tiên",
+            value="\n".join(topic_lines)[:1024],
+            inline=False,
+        )
+
+    weak_items = plan.get("weak_items", [])
+    if weak_items:
+        weak_lines = []
+        for item in weak_items[:5]:
+            channel_name = (item.get("channel_name") or "unknown").strip()
+            question = str(item.get("question") or "").strip()[:80]
+            weak_lines.append(f"• #{channel_name}: {question}")
+        embed.add_field(
+            name="⚠️ Thẻ yếu/chưa trả lời",
+            value="\n".join(weak_lines)[:1024],
+            inline=False,
+        )
+
+    actions = plan.get("next_actions", []) or ["Tiếp tục duy trì lịch học đều."]
+    embed.add_field(
+        name="🗺️ Gợi ý hành động",
+        value="\n".join([f"• {a}" for a in actions[:5]])[:1024],
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ==============================
@@ -3535,29 +5241,15 @@ async def slash_calendar(interaction: discord.Interaction, date: str = ""):
     calendar_data = await knowledge_bot.get_calendar(target_date)
 
     date_display = target_date.strftime("%d/%m") if target_date else "hôm nay"
-    message = f"📅 **Lịch {date_display}:**\n\n"
-
     events = calendar_data["events"]
-    if events:
-        message += "**📌 EVENTS:**\n"
-        for e in events:
-            icon = "🔴" if e["is_important"] else "•"
-            time_str = f"{e['time']}-{e['end_time']}" if e["end_time"] else e["time"]
-            message += f"{icon} {time_str} {e['summary']}\n"
-        message += "\n"
-
     tasks_list = calendar_data["tasks"]
-    if tasks_list:
-        message += "**📋 TASKS:**\n"
-        for t in tasks_list:
-            icon = "🔴" if t["overdue"] else "•"
-            time_str = t["due_time"].strftime("%H:%M") if t["due_time"] else ""
-            message += f"{icon} {time_str} {t['title']}\n"
-
-    if not events and not tasks_list:
-        message += "Không có gì cả"
-
-    await interaction.response.send_message(message)
+    embed = build_calendar_embed(
+        date_display=date_display,
+        events=events,
+        tasks=tasks_list,
+        timestamp=datetime.now(VIETNAM_TZ),
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="events", description="Xem danh sách events")
@@ -3578,16 +5270,12 @@ async def slash_events(interaction: discord.Interaction, date: str = ""):
     _last_events[interaction.user.id] = events
 
     date_display = target_date.strftime("%d/%m") if target_date else "hôm nay"
-    message = f"📅 **Events {date_display}:**\n\n"
-
-    for i, e in enumerate(events, 1):
-        icon = "🔴" if e["is_important"] else ""
-        time_str = f"{e['time']}-{e['end_time']}" if e["end_time"] else e["time"]
-        message += f"{i}. {icon} {time_str} **{e['summary']}**\n"
-        if e["description"]:
-            message += f"   ↳ {e['description'][:100]}\n"
-
-    await interaction.response.send_message(message)
+    embed = build_events_embed(
+        date_display=date_display,
+        events=events,
+        timestamp=datetime.now(VIETNAM_TZ),
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="add_event", description="Thêm event vào Google Calendar")
@@ -3758,18 +5446,13 @@ async def slash_tasks(interaction: discord.Interaction, date: str = ""):
     _last_tasks[interaction.user.id] = tasks_list
 
     date_display = target_date.strftime("%d/%m") if target_date else ""
-    message = f"📋 **Tasks {date_display}:**\n\n"
-
-    for i, task in enumerate(tasks_list, 1):
-        icon = "🔴" if task["overdue"] else "•"
-        time_str = task["due_time"].strftime("%H:%M") if task["due_time"] else ""
-        due_str = task["due"].strftime("%d/%m") if task["due"] else "Không hạn"
-        message += f"{i}. {icon} **{task['title']}** ({due_str} {time_str})\n"
-        if task["notes"]:
-            message += f"   ↳ {task['notes'][:100]}\n"
-
-    message += "\n💡 `/done <số>` để hoàn thành"
-    await interaction.response.send_message(message)
+    embed = build_tasks_embed(
+        date_display=date_display,
+        tasks=tasks_list,
+        timestamp=datetime.now(VIETNAM_TZ),
+        overdue_only=False,
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="overdue", description="Xem tasks quá hạn")
@@ -3787,13 +5470,13 @@ async def slash_overdue(interaction: discord.Interaction):
 
     _last_tasks[interaction.user.id] = overdue_tasks
 
-    message = f"🔴 **Tasks quá hạn ({len(overdue_tasks)}):**\n\n"
-    for i, task in enumerate(overdue_tasks, 1):
-        due_str = task["due"].strftime("%d/%m") if task["due"] else "N/A"
-        message += f"{i}. **{task['title']}** (hạn: {due_str})\n"
-
-    message += "\n💡 `/done <số>` để hoàn thành"
-    await interaction.response.send_message(message)
+    embed = build_tasks_embed(
+        date_display="",
+        tasks=overdue_tasks,
+        timestamp=datetime.now(VIETNAM_TZ),
+        overdue_only=True,
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="add_task", description="Thêm task mới")
