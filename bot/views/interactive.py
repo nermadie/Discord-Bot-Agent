@@ -19,6 +19,8 @@ _mark_question_answered = None
 _build_question_theory_text = None
 _build_study_context_text = None
 _continue_summary_for_user = None
+_get_daily_mission_status = None
+_fetch_motivational_slogan = None
 
 
 def configure_views(
@@ -37,6 +39,8 @@ def configure_views(
     build_question_theory_text,
     build_study_context_text,
     continue_summary_for_user,
+    get_daily_mission_status,
+    fetch_motivational_slogan,
 ):
     """Inject runtime dependencies used by interactive Discord views/modals."""
     global _chat_sessions
@@ -53,6 +57,8 @@ def configure_views(
     global _build_question_theory_text
     global _build_study_context_text
     global _continue_summary_for_user
+    global _get_daily_mission_status
+    global _fetch_motivational_slogan
 
     _chat_sessions = chat_sessions
     _pending_chat_context = pending_chat_context
@@ -68,6 +74,8 @@ def configure_views(
     _build_question_theory_text = build_question_theory_text
     _build_study_context_text = build_study_context_text
     _continue_summary_for_user = continue_summary_for_user
+    _get_daily_mission_status = get_daily_mission_status
+    _fetch_motivational_slogan = fetch_motivational_slogan
 
 
 class ChatSessionView(discord.ui.View):
@@ -299,6 +307,16 @@ class StudyAnswerModal(discord.ui.Modal):
             )[:1024],
             inline=False,
         )
+        mission_lines = list(updated_stats.get("daily_mission_lines") or [])
+        mission_summary = str(updated_stats.get("daily_mission_summary") or "")
+        if mission_summary or mission_lines:
+            preview = "\n".join(mission_lines[:3])
+            mission_text = f"{mission_summary}\n{preview}".strip()[:1024]
+            embed.add_field(
+                name="🎯 Nhiệm vụ hôm nay",
+                value=mission_text,
+                inline=False,
+            )
         if sm2_result:
             embed.add_field(
                 name="🧠 Spaced Repetition",
@@ -311,6 +329,50 @@ class StudyAnswerModal(discord.ui.Modal):
             )
         embed.set_footer(text=f"Đang trả lời bằng: {review.get('model')}")
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+        completed_missions = list(updated_stats.get("completed_missions") or [])
+        if completed_missions:
+            total_reward = sum(
+                int(item.get("reward_points") or 0) for item in completed_missions
+            )
+            mission_lines = [
+                f"✅ {str(item.get('title') or 'Nhiệm vụ')} (+{int(item.get('reward_points') or 0)}đ)"
+                for item in completed_missions
+            ]
+            await interaction.followup.send(
+                "🎉 Bạn vừa hoàn thành nhiệm vụ tự học trong ngày!\n"
+                + "\n".join(mission_lines)
+                + f"\n⭐ Thưởng nhiệm vụ: +{total_reward} điểm",
+                ephemeral=True,
+            )
+
+            slogan_text = ""
+            if _fetch_motivational_slogan:
+                try:
+                    slogan_text = str(await _fetch_motivational_slogan()).strip()
+                except Exception:
+                    slogan_text = ""
+
+            cat_result = {}
+            try:
+                cat_result = await _knowledge_bot.get_random_cat_image()
+            except Exception:
+                cat_result = {}
+
+            reward_embed = discord.Embed(
+                title="🐱 Phần thưởng nhiệm vụ",
+                description=(
+                    f"💪 **Slogan học tập:**\n*{slogan_text}*"
+                    if slogan_text
+                    else "💪 Giữ nhịp học đều mỗi ngày, bạn đang đi đúng hướng!"
+                ),
+                color=discord.Color.blurple(),
+                timestamp=datetime.now(VIETNAM_TZ),
+            )
+            if cat_result.get("ok") and cat_result.get("url"):
+                reward_embed.set_image(url=str(cat_result.get("url")))
+                reward_embed.set_footer(text="Source: TheCatAPI")
+            await interaction.followup.send(embed=reward_embed, ephemeral=True)
 
 
 class SummaryAnswerButton(discord.ui.Button):

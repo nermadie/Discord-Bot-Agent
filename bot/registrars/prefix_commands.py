@@ -37,6 +37,7 @@ def register_prefix_commands(bot, deps):
     _normalize_score_value = deps["_normalize_score_value"]
     _record_spaced_review = deps["_record_spaced_review"]
     _build_study_metrics_embed = deps["_build_study_metrics_embed"]
+    _get_daily_mission_status = deps["_get_daily_mission_status"]
     _mark_question_answered = deps["_mark_question_answered"]
     _split_text_chunks = deps["_split_text_chunks"]
     _format_rich_text_for_discord = deps["_format_rich_text_for_discord"]
@@ -45,6 +46,58 @@ def register_prefix_commands(bot, deps):
 
     ChatSessionView = deps["ChatSessionView"]
     SummaryInteractiveView = deps["SummaryInteractiveView"]
+
+    def _build_mission_progress_text(user_id, stats_payload=None):
+        payload = stats_payload or {}
+        lines = list(payload.get("daily_mission_lines") or [])
+        summary = str(payload.get("daily_mission_summary") or "").strip()
+        if not lines and not summary:
+            mission_status = _get_daily_mission_status(user_id)
+            lines = list(mission_status.get("lines") or [])
+            summary = str(mission_status.get("summary") or "").strip()
+        preview = "\n".join(lines[:3])
+        return f"{summary}\n{preview}".strip()[:1024]
+
+    async def _send_mission_completion_reward(ctx, stats_payload):
+        completed = list((stats_payload or {}).get("completed_missions") or [])
+        if not completed:
+            return
+
+        total_reward = sum(int(item.get("reward_points") or 0) for item in completed)
+        lines = [
+            f"✅ {str(item.get('title') or 'Nhiệm vụ')} (+{int(item.get('reward_points') or 0)}đ)"
+            for item in completed
+        ]
+        await ctx.send(
+            "🎉 Hoàn thành nhiệm vụ tự học trong ngày!\n"
+            + "\n".join(lines)
+            + f"\n⭐ Thưởng nhiệm vụ: +{total_reward} điểm"
+        )
+
+        try:
+            slogan_text = str(await _fetch_motivational_slogan()).strip()
+        except Exception:
+            slogan_text = ""
+
+        try:
+            cat_result = await knowledge_bot.get_random_cat_image()
+        except Exception:
+            cat_result = {}
+
+        reward_embed = discord.Embed(
+            title="🐱 Phần thưởng nhiệm vụ",
+            description=(
+                f"💪 **Slogan học tập:**\n*{slogan_text}*"
+                if slogan_text
+                else "💪 Giữ nhịp học đều mỗi ngày, bạn đang đi đúng hướng!"
+            ),
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(VIETNAM_TZ),
+        )
+        if cat_result.get("ok") and cat_result.get("url"):
+            reward_embed.set_image(url=str(cat_result.get("url")))
+            reward_embed.set_footer(text="Source: TheCatAPI")
+        await ctx.send(embed=reward_embed)
 
     @bot.command(name="help")
     async def show_help(ctx, category=""):
@@ -925,13 +978,19 @@ def register_prefix_commands(bot, deps):
                         summary_data.get("detailed_summary", ""),
                     )
 
-                    _append_study_event(
+                    summary_stats = _append_study_event(
                         user_id=ctx.author.id,
                         event_type="summary",
                         points_delta=0,
                         channel_name=channel_name,
                         note=f"Tạo summary với {len(messages)} tin nhắn",
                     )
+                    mission_text = _build_mission_progress_text(
+                        ctx.author.id, summary_stats
+                    )
+                    if mission_text:
+                        await ctx.send(f"🎯 **Nhiệm vụ hôm nay**\n{mission_text}")
+                    await _send_mission_completion_reward(ctx, summary_stats)
 
                     for item in numbered_questions:
                         _study_questions[ctx.author.id].append(
@@ -1048,6 +1107,11 @@ def register_prefix_commands(bot, deps):
             )[:1024],
             inline=False,
         )
+        mission_text = _build_mission_progress_text(ctx.author.id, stats)
+        if mission_text:
+            embed.add_field(
+                name="🎯 Nhiệm vụ hôm nay", value=mission_text, inline=False
+            )
         if sm2_result:
             embed.add_field(
                 name="🧠 Spaced Repetition",
@@ -1060,6 +1124,7 @@ def register_prefix_commands(bot, deps):
             )
         embed.set_footer(text=f"Đang trả lời bằng: {review['model']}")
         await ctx.send(embed=embed)
+        await _send_mission_completion_reward(ctx, stats)
 
     @bot.command()
     async def stats(ctx):

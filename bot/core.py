@@ -13,6 +13,7 @@ from bot.services.knowledge_service import KnowledgeBot
 from bot.services.study_service import (
     _append_study_event,
     _apply_unanswered_penalty,
+    _get_daily_mission_status,
     _build_question_theory_text,
     _build_study_metrics_embed,
     _ensure_study_memory_tables,
@@ -581,6 +582,8 @@ configure_views(
     build_question_theory_text=_build_question_theory_text,
     build_study_context_text=_build_study_context_text,
     continue_summary_for_user=_continue_summary_for_user,
+    get_daily_mission_status=_get_daily_mission_status,
+    fetch_motivational_slogan=_fetch_motivational_slogan,
 )
 
 register_events_and_tasks(
@@ -638,6 +641,7 @@ register_prefix_commands(
         "_normalize_score_value": _normalize_score_value,
         "_record_spaced_review": _record_spaced_review,
         "_build_study_metrics_embed": _build_study_metrics_embed,
+        "_get_daily_mission_status": _get_daily_mission_status,
         "_mark_question_answered": _mark_question_answered,
         "_split_text_chunks": _split_text_chunks,
         "_format_rich_text_for_discord": _format_rich_text_for_discord,
@@ -682,6 +686,7 @@ register_slash_commands(
         "_normalize_score_value": _normalize_score_value,
         "_record_spaced_review": _record_spaced_review,
         "_build_study_metrics_embed": _build_study_metrics_embed,
+        "_get_daily_mission_status": _get_daily_mission_status,
         "_mark_question_answered": _mark_question_answered,
         "_ensure_study_memory_tables": _ensure_study_memory_tables,
         "_split_text_chunks": _split_text_chunks,

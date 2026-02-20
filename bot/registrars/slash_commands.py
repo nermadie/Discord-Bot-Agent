@@ -51,6 +51,7 @@ def register_slash_commands(bot, deps):
     _normalize_score_value = deps["_normalize_score_value"]
     _record_spaced_review = deps["_record_spaced_review"]
     _build_study_metrics_embed = deps["_build_study_metrics_embed"]
+    _get_daily_mission_status = deps["_get_daily_mission_status"]
     _mark_question_answered = deps["_mark_question_answered"]
     _ensure_study_memory_tables = deps["_ensure_study_memory_tables"]
     _split_text_chunks = deps["_split_text_chunks"]
@@ -60,6 +61,59 @@ def register_slash_commands(bot, deps):
 
     ChatSessionView = deps["ChatSessionView"]
     SummaryInteractiveView = deps["SummaryInteractiveView"]
+
+    def _build_mission_progress_text(user_id, stats_payload=None):
+        payload = stats_payload or {}
+        lines = list(payload.get("daily_mission_lines") or [])
+        summary = str(payload.get("daily_mission_summary") or "").strip()
+        if not lines and not summary:
+            mission_status = _get_daily_mission_status(user_id)
+            lines = list(mission_status.get("lines") or [])
+            summary = str(mission_status.get("summary") or "").strip()
+        preview = "\n".join(lines[:3])
+        return f"{summary}\n{preview}".strip()[:1024]
+
+    async def _send_mission_completion_reward(interaction, stats_payload):
+        completed = list((stats_payload or {}).get("completed_missions") or [])
+        if not completed:
+            return
+
+        total_reward = sum(int(item.get("reward_points") or 0) for item in completed)
+        lines = [
+            f"✅ {str(item.get('title') or 'Nhiệm vụ')} (+{int(item.get('reward_points') or 0)}đ)"
+            for item in completed
+        ]
+        await _safe_followup_send(
+            interaction,
+            "🎉 Hoàn thành nhiệm vụ tự học trong ngày!\n"
+            + "\n".join(lines)
+            + f"\n⭐ Thưởng nhiệm vụ: +{total_reward} điểm",
+        )
+
+        try:
+            slogan_text = str(await _fetch_motivational_slogan()).strip()
+        except Exception:
+            slogan_text = ""
+
+        try:
+            cat_result = await knowledge_bot.get_random_cat_image()
+        except Exception:
+            cat_result = {}
+
+        reward_embed = discord.Embed(
+            title="🐱 Phần thưởng nhiệm vụ",
+            description=(
+                f"💪 **Slogan học tập:**\n*{slogan_text}*"
+                if slogan_text
+                else "💪 Giữ nhịp học đều mỗi ngày, bạn đang đi đúng hướng!"
+            ),
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(VIETNAM_TZ),
+        )
+        if cat_result.get("ok") and cat_result.get("url"):
+            reward_embed.set_image(url=str(cat_result.get("url")))
+            reward_embed.set_footer(text="Source: TheCatAPI")
+        await _safe_followup_send(interaction, embed=reward_embed)
 
     @bot.tree.command(name="help", description="Xem lệnh nhanh của bot")
     @app_commands.describe(category="Nhóm lệnh muốn xem")
@@ -252,8 +306,9 @@ def register_slash_commands(bot, deps):
             )
             return
         _mark_user_interaction(interaction.user.id)
+        await interaction.response.defer(thinking=True)
         text = await _fetch_motivational_slogan()
-        await interaction.response.send_message(f"💪 **Slogan học tập:**\n*{text}*")
+        await _safe_followup_send(interaction, f"💪 **Slogan học tập:**\n*{text}*")
 
     @bot.tree.command(
         name="animal",
@@ -680,13 +735,23 @@ def register_slash_commands(bot, deps):
                 summary_data.get("detailed_summary", ""),
             )
 
-            _append_study_event(
+            summary_stats = _append_study_event(
                 user_id=interaction.user.id,
                 event_type="summary",
                 points_delta=0,
                 channel_name=channel_name,
                 note=f"Tạo summary với {len(messages)} tin nhắn",
             )
+
+            mission_text = _build_mission_progress_text(
+                interaction.user.id, summary_stats
+            )
+            if mission_text:
+                await _safe_followup_send(
+                    interaction,
+                    f"🎯 **Nhiệm vụ hôm nay**\n{mission_text}",
+                )
+            await _send_mission_completion_reward(interaction, summary_stats)
 
             for item in numbered_questions:
                 _study_questions[interaction.user.id].append(
@@ -847,6 +912,11 @@ def register_slash_commands(bot, deps):
             )[:1024],
             inline=False,
         )
+        mission_text = _build_mission_progress_text(interaction.user.id, stats)
+        if mission_text:
+            embed.add_field(
+                name="🎯 Nhiệm vụ hôm nay", value=mission_text, inline=False
+            )
         if sm2_result:
             embed.add_field(
                 name="🧠 Spaced Repetition",
@@ -859,6 +929,7 @@ def register_slash_commands(bot, deps):
             )
         embed.set_footer(text=f"Đang trả lời bằng: {review['model']}")
         await interaction.followup.send(embed=embed)
+        await _send_mission_completion_reward(interaction, stats)
 
     @bot.tree.command(
         name="study_stats", description="Xem streak và điểm học tập tháng hiện tại"
