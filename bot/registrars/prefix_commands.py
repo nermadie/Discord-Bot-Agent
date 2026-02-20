@@ -58,6 +58,31 @@ def register_prefix_commands(bot, deps):
         preview = "\n".join(lines[:3])
         return f"{summary}\n{preview}".strip()[:1024]
 
+    def _build_slogan_embed(slogan_text, title="💪 Slogan học tập"):
+        raw_lines = [str(line).strip() for line in str(slogan_text or "").splitlines()]
+        raw_lines = [line for line in raw_lines if line]
+
+        source_line = next(
+            (line for line in raw_lines if line.lower().startswith("nguồn:")),
+            "",
+        )
+        quote_lines = [line for line in raw_lines if line != source_line]
+        quote_text = "\n".join(quote_lines).strip()
+
+        embed = discord.Embed(
+            title=title,
+            description=(f"*{quote_text}*" if quote_text else "(không có nội dung)"),
+            color=discord.Color.gold(),
+            timestamp=datetime.now(VIETNAM_TZ),
+        )
+        if source_line:
+            embed.add_field(
+                name="Nguồn",
+                value=source_line.replace("Nguồn:", "").strip(),
+                inline=False,
+            )
+        return embed
+
     async def _send_mission_completion_reward(ctx, stats_payload):
         completed = list((stats_payload or {}).get("completed_missions") or [])
         if not completed:
@@ -84,15 +109,13 @@ def register_prefix_commands(bot, deps):
         except Exception:
             cat_result = {}
 
-        reward_embed = discord.Embed(
-            title="🐱 Phần thưởng nhiệm vụ",
-            description=(
-                f"💪 **Slogan học tập:**\n*{slogan_text}*"
+        reward_embed = _build_slogan_embed(
+            (
+                slogan_text
                 if slogan_text
-                else "💪 Giữ nhịp học đều mỗi ngày, bạn đang đi đúng hướng!"
+                else "Giữ nhịp học đều mỗi ngày, bạn đang đi đúng hướng!"
             ),
-            color=discord.Color.blurple(),
-            timestamp=datetime.now(VIETNAM_TZ),
+            title="🐱 Phần thưởng nhiệm vụ",
         )
         if cat_result.get("ok") and cat_result.get("url"):
             reward_embed.set_image(url=str(cat_result.get("url")))
@@ -782,7 +805,7 @@ def register_prefix_commands(bot, deps):
             return
         _mark_user_interaction(ctx.author.id)
         text = await _fetch_motivational_slogan()
-        await ctx.send(f"💪 **Slogan học tập:**\n*{text}*")
+        await ctx.send(embed=_build_slogan_embed(text))
 
     @bot.command()
     async def chat(ctx, *, prompt=""):

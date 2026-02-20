@@ -36,6 +36,31 @@ def register_events_and_tasks(bot, deps):
     _build_study_status_text = deps["_build_study_status_text"]
     _build_summary_embed = deps["_build_summary_embed"]
 
+    def _build_slogan_embed(slogan_text, title="💪 Slogan học tập"):
+        raw_lines = [str(line).strip() for line in str(slogan_text or "").splitlines()]
+        raw_lines = [line for line in raw_lines if line]
+
+        source_line = next(
+            (line for line in raw_lines if line.lower().startswith("nguồn:")),
+            "",
+        )
+        quote_lines = [line for line in raw_lines if line != source_line]
+        quote_text = "\n".join(quote_lines).strip()
+
+        embed = discord.Embed(
+            title=title,
+            description=(f"*{quote_text}*" if quote_text else "(không có nội dung)"),
+            color=discord.Color.gold(),
+            timestamp=datetime.now(VIETNAM_TZ),
+        )
+        if source_line:
+            embed.add_field(
+                name="Nguồn",
+                value=source_line.replace("Nguồn:", "").strip(),
+                inline=False,
+            )
+        return embed
+
     WEATHER_ALERT_INTERVAL_HOURS = int(
         deps.get("WEATHER_ALERT_INTERVAL_HOURS", CFG_WEATHER_ALERT_INTERVAL_HOURS)
     )
@@ -170,11 +195,13 @@ def register_events_and_tasks(bot, deps):
                 return
 
         slogan = await _fetch_motivational_slogan()
-        await channel.send(
-            f"💡 **Nhắc nhẹ học tập**\n"
-            f"Bạn đã im lặng khoảng **{int(idle_minutes)} phút**.\n"
-            f"*{slogan}*"
+        embed = _build_slogan_embed(slogan, title="💡 Nhắc nhẹ học tập")
+        embed.add_field(
+            name="Trạng thái",
+            value=f"Bạn đã im lặng khoảng **{int(idle_minutes)} phút**.",
+            inline=False,
         )
+        await channel.send(embed=embed)
         _last_slogan_sent_at[YOUR_USER_ID] = now
 
     @idle_motivation.before_loop

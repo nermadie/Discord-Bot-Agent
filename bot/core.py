@@ -1,5 +1,6 @@
 import asyncio
 import random
+from collections import deque
 from datetime import datetime
 
 import aiohttp
@@ -47,6 +48,20 @@ bot.remove_command("help")
 
 
 knowledge_bot = KnowledgeBot()
+_recent_slogans = deque(maxlen=8)
+
+
+def _pick_non_repeating_quote(candidates, recent_window=4):
+    """Pick one quote while avoiding very recent repeats when possible."""
+    items = [str(item).strip() for item in (candidates or []) if str(item).strip()]
+    if not items:
+        return ""
+
+    recent_values = list(_recent_slogans)[-max(1, int(recent_window)) :]
+    non_recent = [item for item in items if item not in recent_values]
+    selected = random.choice(non_recent or items)
+    _recent_slogans.append(selected)
+    return selected
 
 
 def _get_summary_channel_option_items():
@@ -142,6 +157,12 @@ async def _fetch_motivational_slogan():
         "1% tiến bộ mỗi ngày vẫn là tiến bộ.",
         "Bạn không cần chạy nhanh, chỉ cần học đều.",
         "Mỗi lần ngồi vào bàn học là một lần thắng sự trì hoãn.",
+        "Consistency beats intensity when intensity is temporary.",
+        "Small progress every day creates big results over time.",
+        "Focus on the process, and the results will follow.",
+        "Discipline is choosing what you want most over what you want now.",
+        "One focused study session is better than ten distracted hours.",
+        "Learn slowly if needed, but learn every day.",
     ]
 
     study_keywords = {
@@ -155,40 +176,154 @@ async def _fetch_motivational_slogan():
         "practice",
         "school",
         "book",
+        "focus",
+        "progress",
+        "growth",
+        "habit",
+        "knowledge",
+        "học",
+        "học tập",
+        "kiến thức",
+        "kỷ luật",
+        "tiến bộ",
     }
 
     def _is_study_oriented(text):
         lowered = str(text or "").lower()
         return any(keyword in lowered for keyword in study_keywords)
 
-    try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=8)
-        ) as session:
-            async with session.get(
-                "https://api.quotable.io/random",
-                params={"tags": "education|inspirational|success"},
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, dict):
-                        quote = str(data.get("content", "")).strip()
-                        author = str(data.get("author", "")).strip()
-                        if quote:
-                            return f"{quote} — {author}" if author else quote
+    def _build_quote_value(quote, author=""):
+        quote_text = str(quote or "").strip()
+        author_text = str(author or "").strip()
+        if not quote_text:
+            return ""
+        return f"{quote_text} — {author_text}" if author_text else quote_text
 
-            async with session.get("https://zenquotes.io/api/random") as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, list) and data:
-                        quote = str(data[0].get("q", "")).strip()
-                        author = str(data[0].get("a", "")).strip()
-                        if quote and _is_study_oriented(quote):
-                            return f"{quote} — {author}" if author else quote
-    except Exception:
-        pass
+    def _extract_quote_candidates(payload):
+        candidates = []
 
-    return random.choice(fallback)
+        if isinstance(payload, dict):
+            direct_quote = (
+                payload.get("content") or payload.get("quote") or payload.get("text")
+            )
+            direct_author = (
+                payload.get("author") or payload.get("by") or payload.get("source")
+            )
+            value = _build_quote_value(direct_quote, direct_author)
+            if value:
+                candidates.append(value)
+
+            data_block = payload.get("data")
+            if isinstance(data_block, dict):
+                value = _build_quote_value(
+                    data_block.get("content")
+                    or data_block.get("quote")
+                    or data_block.get("text"),
+                    data_block.get("author")
+                    or data_block.get("by")
+                    or data_block.get("source"),
+                )
+                if value:
+                    candidates.append(value)
+
+            quote_item = payload.get("quote")
+            if isinstance(quote_item, dict):
+                value = _build_quote_value(
+                    quote_item.get("content")
+                    or quote_item.get("quote")
+                    or quote_item.get("text"),
+                    quote_item.get("author")
+                    or quote_item.get("by")
+                    or quote_item.get("source"),
+                )
+                if value:
+                    candidates.append(value)
+
+        if isinstance(payload, list):
+            for item in payload[:5]:
+                if isinstance(item, dict):
+                    value = _build_quote_value(
+                        item.get("q")
+                        or item.get("content")
+                        or item.get("quote")
+                        or item.get("text"),
+                        item.get("a")
+                        or item.get("author")
+                        or item.get("by")
+                        or item.get("source"),
+                    )
+                    if value:
+                        candidates.append(value)
+
+        return candidates
+
+    def _with_source(quote_text, source_name):
+        quote_value = str(quote_text or "").strip()
+        source_value = str(source_name or "").strip()
+        if not quote_value:
+            return ""
+        if not source_value:
+            return quote_value
+        return f"{quote_value}\nNguồn: {source_value}"
+
+    providers = [
+        {
+            "name": "Quotable",
+            "url": "https://api.quotable.io/random",
+            "params": {"tags": "education|inspirational|success"},
+            "filter": None,
+        },
+        {
+            "name": "ZenQuotes",
+            "url": "https://zenquotes.io/api/random",
+            "params": None,
+            "filter": lambda items: [
+                item
+                for item in items
+                if _is_study_oriented(item) or len(str(item)) >= 35
+            ],
+        },
+        {
+            "name": "Programming Quotes API",
+            "url": "https://programming-quotesapi.vercel.app/api/random",
+            "params": None,
+            "filter": None,
+        },
+        {
+            "name": "The Quotes Hub",
+            "url": "https://thequoteshub.com/api/",
+            "params": None,
+            "filter": None,
+        },
+    ]
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=8),
+        headers={"User-Agent": "Discord-Agent-Bot/1.0 (+https://discord.com)"},
+    ) as session:
+        for provider in providers:
+            try:
+                async with session.get(
+                    provider["url"], params=provider.get("params")
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+
+                    data = await resp.json(content_type=None)
+                    candidates = _extract_quote_candidates(data)
+                    filter_fn = provider.get("filter")
+                    if callable(filter_fn):
+                        candidates = filter_fn(candidates)
+                    if not candidates:
+                        continue
+
+                    picked = _pick_non_repeating_quote(candidates, recent_window=6)
+                    return _with_source(picked, provider["name"])
+            except Exception:
+                continue
+
+    picked_fallback = _pick_non_repeating_quote(fallback, recent_window=6)
+    return _with_source(picked_fallback, "Local fallback")
 
 
 async def _collect_new_messages_since(
